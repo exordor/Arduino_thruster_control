@@ -1,0 +1,46 @@
+# Arduino IDE
+*.hex
+*.eep
+*.elf
+*.lss
+*.map
+*.sym
+*.d
+*.o
+*.a
+*.bin
+
+# Build directories
+build/
+*.build/
+
+# Libraries (uncomment if you want to ignore them)
+# libraries/
+
+# IDE specific files
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln.docstates
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Backup files
+*~
+*.bak
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
