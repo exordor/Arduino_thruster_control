@@ -8,7 +8,8 @@ This is an Arduino project for controlling dual thrusters (Left/Right) with mult
 
 - **original/** - Original RC remote control version
 - **ros_control/** - ROS + RC mixed control version
-- **wifi_control/** - WiFi control version (in development)
+- **wifi_control/** - WiFi control version
+- **wifi_RC_control/** - WiFi + RC hybrid control with automatic priority switching
 
 ## Features
 
@@ -26,7 +27,18 @@ This is an Arduino project for controlling dual thrusters (Left/Right) with mult
 - Real-time status output: `S <mode> <outL> <outR>\n`
 
 ### WiFi Control
-- In development...
+- TCP server on Arduino (192.168.50.100:8888)
+- Receives commands from ROS via network
+- Command format: `C <left_us> <right_us>\n`
+- Status reporting: `S <left_us> <right_us>\n` at 10Hz
+- WiFi-only, no RC fallback
+
+### WiFi + RC Control
+- Combines WiFi and RC with automatic priority switching
+- **Priority**: WiFi > RC > Failsafe
+- WiFi timeout: 500ms (auto-switch to RC)
+- RC timeout: 200ms (auto-switch to neutral)
+- Best of both worlds: wireless control with RC safety backup
 
 ## Hardware Connection
 
