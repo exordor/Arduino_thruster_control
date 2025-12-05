@@ -78,19 +78,19 @@ S <mode> <left_us> <right_us>\n
 ### Mode 1: WiFi Control
 ```
 WiFi Client Connected → Receiving Commands → WiFi Active
-Status: "Mode: WiFi | WiFi: CONNECTED | L=1600 R=1500"
+Status: "Mode: WiFi | WiFi link: CONNECTED | Client: CONNECTED | L=1600 R=1500"
 ```
 
 ### Mode 2: RC Fallback
 ```
 WiFi Timeout (>500ms) OR No WiFi → RC Active
-Status: "Mode: RC | WiFi: DISCONNECTED | L=1500 R=1500"
+Status: "Mode: RC | WiFi link: DISCONNECTED | Client: DISCONNECTED | L=1500 R=1500"
 ```
 
 ### Mode 3: Full Failsafe
 ```
 No WiFi AND No RC → Neutral Position
-Status: "Mode: RC | WiFi: DISCONNECTED | L=1500 R=1500"
+Status: "Mode: RC | WiFi link: DISCONNECTED | Client: DISCONNECTED | L=1500 R=1500"
 ```
 
 ## Timeout Settings
