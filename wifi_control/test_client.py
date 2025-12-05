@@ -14,6 +14,7 @@ class ArduinoThrusterClient:
         self.arduino_port = arduino_port
         self.sock = None
         self.connected = False
+        self.last_status = None  # (mode, left_us, right_us) or (None, left, right)
         
     def connect(self):
         """Connect to Arduino TCP server"""
@@ -22,6 +23,13 @@ class ArduinoThrusterClient:
             self.sock.settimeout(5.0)
             print(f"Connecting to Arduino at {self.arduino_ip}:{self.arduino_port}...")
             self.sock.connect((self.arduino_ip, self.arduino_port))
+            # After successful connect, use shorter timeout for responsive reads
+            self.sock.settimeout(1.0)
+            try:
+                # Send a tiny handshake to ensure the server marks the client as connected
+                self.sock.sendall(b"HELLO\n")
+            except Exception:
+                pass
             self.connected = True
             print("✓ Connected to Arduino!")
             return True
@@ -86,13 +94,22 @@ class ArduinoThrusterClient:
                     line, buffer = buffer.split('\n', 1)
                     if line.startswith('S '):
                         parts = line.split()
-                        if len(parts) == 3:
-                            try:
+                        try:
+                            if len(parts) >= 4:
+                                # Format: S <mode> <left> <right>
+                                mode = int(parts[1])
+                                left_us = int(parts[2])
+                                right_us = int(parts[3])
+                                self.last_status = (mode, left_us, right_us)
+                                print(f"← Status: mode={mode} | Left={left_us}µs | Right={right_us}µs")
+                            elif len(parts) == 3:
+                                # Fallback: S <left> <right>
                                 left_us = int(parts[1])
                                 right_us = int(parts[2])
+                                self.last_status = (None, left_us, right_us)
                                 print(f"← Status: Left={left_us}µs | Right={right_us}µs")
-                            except ValueError:
-                                pass
+                        except ValueError:
+                            print(f"← Malformed status line: {line}")
                                 
             except socket.timeout:
                 continue
@@ -124,6 +141,7 @@ def main():
     print("  stop              - Stop thrusters (1500 1500)")
     print("  forward           - Full forward (1900 1900)")
     print("  reverse           - Full reverse (1100 1100)")
+    print("  status            - Show last received status")
     print("  test              - Run test sequence")
     print("  quit              - Exit\n")
     
@@ -149,6 +167,16 @@ def main():
                     
                 elif user_input == 'reverse':
                     client.send_command(1100, 1100)
+
+                elif user_input == 'status':
+                    if client.last_status is None:
+                        print("No status received yet.")
+                    else:
+                        mode, left, right = client.last_status
+                        if mode is None:
+                            print(f"Last status: Left={left}µs | Right={right}µs")
+                        else:
+                            print(f"Last status: mode={mode} | Left={left}µs | Right={right}µs")
                     
                 elif user_input == 'test':
                     print("\n=== Running Test Sequence ===")
