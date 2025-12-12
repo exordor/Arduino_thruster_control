@@ -24,7 +24,7 @@ Hybrid control system combining WiFi/ROS commands and RC receiver input with aut
 ```
 ┌─────────────────────────────────────────┐
 │ Is WiFi client connected?               │
-│ AND received command within 500ms?      │
+│ AND received command within 1000ms?     │
 └──────────┬──────────────────────────────┘
            │
      Yes   │   No
@@ -46,8 +46,8 @@ Hybrid control system combining WiFi/ROS commands and RC receiver input with aut
 ## Hardware Configuration
 
 ### Pins
-- **Pin 2**: RC Left Channel Input
-- **Pin 3**: RC Right Channel Input  
+- **Pin 2**: RC Right Channel Input
+- **Pin 3**: RC Left Channel Input  
 - **Pin 9**: Right ESC Output
 - **Pin 10**: Left ESC Output
 
@@ -83,8 +83,8 @@ Status: "Mode: WiFi | WiFi link: CONNECTED | Client: CONNECTED | L=1600 R=1500"
 
 ### Mode 2: RC Fallback
 ```
-WiFi Timeout (>500ms) OR No WiFi → RC Active
-Status: "Mode: RC | WiFi link: DISCONNECTED | Client: DISCONNECTED | L=1500 R=1500"
+WiFi Timeout (>1000ms) OR No WiFi → RC Active (with brief grace hold)
+Status: "Mode: RC | WiFi link: DISCONNECTED | Client: DISCONNECTED | L=... R=..." (soft decay toward 1500)
 ```
 
 ### Mode 3: Full Failsafe
@@ -98,7 +98,7 @@ Status: "Mode: RC | WiFi link: DISCONNECTED | Client: DISCONNECTED | L=1500 R=15
 | Timeout | Duration | Effect |
 |---------|----------|--------|
 | RC Signal | 200ms | Switch from RC value to neutral |
-| WiFi Command | 500ms | Switch from WiFi to RC mode |
+| WiFi Command | 1000ms | Switch from WiFi to RC mode (with 400ms grace hold + soft decay) |
 | Status Send | 100ms | WiFi status update interval |
 
 ## Testing
@@ -183,7 +183,7 @@ print(data)  # "S 1 1600 1500"
 ### Main Loop Flow
 ```cpp
 1. handleClientConnections()  // Check for new WiFi clients
-2. readRcInputs()             // Read RC PWM (blocking ~20ms)
+2. readRcInputs()             // Read RC PWM via interrupts (non-blocking)
 3. readWifiCommands()         // Parse WiFi commands (non-blocking)
 4. determineControlMode()     // WiFi > RC > Failsafe logic
 5. updateThrusters()          // Apply final values to ESCs
@@ -194,20 +194,20 @@ print(data)  # "S 1 1600 1500"
 ### Key Functions
 
 #### `readRcInputs()`
-- Uses `pulseIn()` to read PWM
-- Maps 950-2000µs to 1100-1900µs
-- Applies deadband around center
-- Implements timeout failsafe
+- Uses interrupt-based capture on pins 2/3 (CHANGE ISR)
+- Maps 950-2000µs to 1100-1900µs (or 9-gear mode)
+- Applies EWMA filtering, ramp limiting, and center deadband
+- Implements RC timeout failsafe (200ms)
 
 #### `readWifiCommands()`
 - Non-blocking parse of TCP stream
-- Command format validation
-- Constrains values to safe range
+- Command format validation (expects `C <left_us> <right_us>\n`)
+- Constrains values to safe range and applies EWMA + ramp smoothing
 
 #### `determineControlMode()`
-- Evaluates control priority
-- Sets `currentMode` (0=RC, 1=WiFi)
-- Updates `currentLeftUs` and `currentRightUs`
+- Evaluates control priority (WiFi > RC > Failsafe)
+- WiFi timeout = 1000ms; within additional 400ms grace window, holds last WiFi output and softly decays toward 1500
+- Sets `currentMode` (0=RC, 1=WiFi) and updates outputs without sudden neutral drops
 
 ## Safety Features
 
