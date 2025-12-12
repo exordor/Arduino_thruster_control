@@ -36,7 +36,9 @@ const int ESC_LEFT_OUT = 10;   // Left ESC signal output
 
 // === Timing Constants ===
 const unsigned long RC_FAILSAFE_MS = 200;            // RC signal timeout
-const unsigned long WIFI_CMD_TIMEOUT_MS = 500;       // WiFi command timeout
+const unsigned long WIFI_CMD_TIMEOUT_MS = 1000;      // WiFi command timeout (more tolerant)
+const unsigned long WIFI_GRACE_MS = 400;             // Hold-last grace after timeout
+const int DECAY_STEP_US = 5;                         // Soft decay step toward 1500
 const unsigned long STATUS_SEND_INTERVAL_MS = 100;   // Status update rate (10Hz)
 
 // === ESC Configuration ===
@@ -273,6 +275,7 @@ void readWifiCommands() {
           if (deltaR < -MAX_STEP_US) deltaR = -MAX_STEP_US;
           wifiAvgR += deltaR;
           
+          // Smoothed WiFi outputs
           wifiOutL = wifiAvgL;
           wifiOutR = wifiAvgR;
           lastWifiCmdMs = millis();
@@ -303,19 +306,31 @@ void determineControlMode() {
                     (now - lastWifiCmdMs < WIFI_CMD_TIMEOUT_MS);
   
   if (wifiActive) {
-    // WiFi has priority
+    // WiFi has priority, preserve smoothing state
     currentMode = 1;
     currentLeftUs = wifiOutL;
     currentRightUs = wifiOutR;
   } else {
-    // Fallback to RC
-    currentMode = 0;
-    currentLeftUs = rcOutL;
-    currentRightUs = rcOutR;
-    
-    // Reset WiFi averages when not in use to prevent jump on mode switch
-    wifiAvgL = ESC_MID;
-    wifiAvgR = ESC_MID;
+    // No recent WiFi command — apply grace hold then soft decay
+    unsigned long age = haveWifiCmd ? (now - lastWifiCmdMs) : WIFI_CMD_TIMEOUT_MS + WIFI_GRACE_MS + 1;
+    if (age <= WIFI_CMD_TIMEOUT_MS + WIFI_GRACE_MS) {
+      // Hold last WiFi filtered values, decay toward neutral
+      currentMode = 1; // still treat as WiFi during grace
+      currentLeftUs = wifiOutL;
+      currentRightUs = wifiOutR;
+      if (currentLeftUs > ESC_MID) currentLeftUs -= DECAY_STEP_US; else if (currentLeftUs < ESC_MID) currentLeftUs += DECAY_STEP_US;
+      if (currentRightUs > ESC_MID) currentRightUs -= DECAY_STEP_US; else if (currentRightUs < ESC_MID) currentRightUs += DECAY_STEP_US;
+      // Keep wifiAvg tracking the decayed values to avoid jumps when WiFi resumes
+      wifiAvgL = currentLeftUs;
+      wifiAvgR = currentRightUs;
+      wifiOutL = wifiAvgL;
+      wifiOutR = wifiAvgR;
+    } else {
+      // Fallback to RC after grace expires
+      currentMode = 0;
+      currentLeftUs = rcOutL;
+      currentRightUs = rcOutR;
+    }
   }
 }
 
@@ -469,10 +484,21 @@ void loop() {
     Serial.print(wifiLink ? "CONNECTED" : "DISCONNECTED");
     Serial.print(" | Client: ");
     Serial.print(clientLink ? "CONNECTED" : "DISCONNECTED");
+    Serial.print(" | CmdAge=");
+    if (haveWifiCmd) {
+      Serial.print(now - lastWifiCmdMs);
+    } else {
+      Serial.print("N/A");
+    }
+    Serial.print("ms");
     Serial.print(" | L=");
     Serial.print(currentLeftUs);
     Serial.print(" R=");
-    Serial.println(currentRightUs);
+    Serial.print(currentRightUs);
+    Serial.print(" | WiFiRaw L="); Serial.print(wifiOutL);
+    Serial.print(" R="); Serial.print(wifiOutR);
+    Serial.print(" | WiFiAvg L="); Serial.print(wifiAvgL);
+    Serial.print(" R="); Serial.println(wifiAvgR);
   }
   
   delay(5);
