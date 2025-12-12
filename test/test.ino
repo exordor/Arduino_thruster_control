@@ -1,0 +1,212 @@
+#include <Servo.h>
+
+// === 引脚定义 (用户校正) ===
+const int CH_RIGHT_IN = 2;   // RX 右通道 PWM 输入（Pin 2）
+const int CH_LEFT_IN  = 3;   // RX 左通道 PWM 输入（Pin 3）
+
+const int ESC_RIGHT_OUT = 9;   // 右侧电调(ESC)输出
+const int ESC_LEFT_OUT  = 10;  // 左侧电调(ESC)输出
+
+// === 时序参数 ===
+const unsigned long FAILSAFE_MS      = 200;    // 故障保护超时 200ms
+
+// === RX 有效范围 (参考 original.ino) ===
+const int RX_VALID_MIN = 950;   // <950 视为断开或故障
+const int RX_VALID_MAX = 2000;  // >2000 视为断开或故障
+const int RC_MID       = 1500;  // 中间值
+const int DEADBAND_US  = 25;    // 中位死区 ±25µs
+
+// === ESC 范围 ===
+const int ESC_MIN = 1100;
+const int ESC_MID = 1500;
+const int ESC_MAX = 1900;
+
+unsigned long lastUpdateL = 0, lastUpdateR = 0;
+unsigned long loopCount = 0;
+
+// === 中断捕获相关 ===
+volatile unsigned long rRiseMicros = 0, rPulseMicros = 0;
+volatile unsigned long lRiseMicros = 0, lPulseMicros = 0;
+
+// 简单滤波（滑动平均）
+int avgR = ESC_MID;
+int avgL = ESC_MID;
+const int FILTER_ALPHA = 20; // 百分比（越大越跟随输入）
+const int MAX_STEP_US   = 10; // 每循环最大变化（软启动斜坡限制）
+
+// 右通道上升沿/下降沿捕获
+void onRightChange() {
+  int level = digitalRead(CH_RIGHT_IN);
+  unsigned long now = micros();
+  if (level == HIGH) {
+    rRiseMicros = now;
+  } else {
+    unsigned long width = now - rRiseMicros;
+    // 仅接受合理范围的脉宽，避免噪声
+    if (width >= 800 && width <= 2200) {
+      rPulseMicros = width;
+    }
+  }
+}
+
+// 左通道上升沿/下降沿捕获
+void onLeftChange() {
+  int level = digitalRead(CH_LEFT_IN);
+  unsigned long now = micros();
+  if (level == HIGH) {
+    lRiseMicros = now;
+  } else {
+    unsigned long width = now - lRiseMicros;
+    if (width >= 800 && width <= 2200) {
+      lPulseMicros = width;
+    }
+  }
+}
+
+Servo escL, escR;
+
+// 规则映射: 950..2000 → 1100..1900；超出范围/超时返回 1500
+int mapLinearToEsc(unsigned long inUs) {
+  if (inUs == 0) return ESC_MID; // 超时/无脉冲
+  if ((int)inUs < RX_VALID_MIN || (int)inUs > RX_VALID_MAX) return ESC_MID; // 非法范围
+  if (abs((int)inUs - RC_MID) <= DEADBAND_US) return ESC_MID; // 中位保持
+
+  // 线性映射，并夹紧到 ESC 范围
+  long out = map((long)inUs, RX_VALID_MIN, RX_VALID_MAX, ESC_MIN, ESC_MAX);
+  if (out < ESC_MIN) out = ESC_MIN;
+  if (out > ESC_MAX) out = ESC_MAX;
+  return (int)out;
+}
+
+void setup() {
+  pinMode(CH_LEFT_IN,  INPUT);
+  pinMode(CH_RIGHT_IN, INPUT);
+
+  Serial.begin(115200);
+  while (!Serial) {}
+
+  // 启用中断捕获（UNO 上 2/3 支持外部中断）
+  attachInterrupt(digitalPinToInterrupt(CH_RIGHT_IN), onRightChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(CH_LEFT_IN),  onLeftChange,  CHANGE);
+
+  // 附加 ESC 输出并进行 1500µs 初始化
+  escR.attach(ESC_RIGHT_OUT);
+  escL.attach(ESC_LEFT_OUT);
+  escR.writeMicroseconds(ESC_MID);
+  escL.writeMicroseconds(ESC_MID);
+  delay(2000); // 让 ESC 进入安全中位
+
+  Serial.println("========================================");
+  Serial.println("PWM 信号测试 - Pin 2(右) 和 Pin 3(左)");
+  Serial.println("========================================");
+  Serial.println("格式: Loop | 右(Pin2)_PWM | 右_状态 | 左(Pin3)_PWM | 左_状态 | 距上次更新时间 | outL|outR");
+  Serial.println();
+}
+
+void loop() {
+  unsigned long now = millis();
+  loopCount++;
+
+  // === 读取中断捕获到的脉宽（非阻塞）===
+  noInterrupts();
+  unsigned long inR = rPulseMicros;
+  unsigned long inL = lPulseMicros;
+  interrupts();
+
+  // 记录最后更新时间
+  if (inL >= RX_VALID_MIN && inL <= RX_VALID_MAX) lastUpdateL = now;
+  if (inR >= RX_VALID_MIN && inR <= RX_VALID_MAX) lastUpdateR = now;
+
+  // === 将输入脉冲映射为 ESC 输出 ===
+  int outL = mapLinearToEsc(inL);
+  int outR = mapLinearToEsc(inR);
+
+  // 简单低通滤波，避免抖动导致电调断续
+  int filtL = (avgL * (100 - FILTER_ALPHA) + outL * FILTER_ALPHA) / 100;
+  int filtR = (avgR * (100 - FILTER_ALPHA) + outR * FILTER_ALPHA) / 100;
+
+  // 软启动斜坡：限制每次更新的最大变化量
+  int deltaL = filtL - avgL;
+  if (deltaL >  MAX_STEP_US) deltaL =  MAX_STEP_US;
+  if (deltaL < -MAX_STEP_US) deltaL = -MAX_STEP_US;
+  avgL += deltaL;
+
+  int deltaR = filtR - avgR;
+  if (deltaR >  MAX_STEP_US) deltaR =  MAX_STEP_US;
+  if (deltaR < -MAX_STEP_US) deltaR = -MAX_STEP_US;
+  avgR += deltaR;
+
+  // 备份故障保护：超时则置中
+  if (now - lastUpdateL > FAILSAFE_MS) avgL = ESC_MID;
+  if (now - lastUpdateR > FAILSAFE_MS) avgR = ESC_MID;
+
+  // 驱动 ESC
+  escR.writeMicroseconds(avgR);
+  escL.writeMicroseconds(avgL);
+
+  // === 输出详细测试结果 ===
+  Serial.print("[");
+  Serial.print(loopCount);
+  Serial.print("] ");
+
+  // Pin 2 → 右通道
+  Serial.print("右(Pin2): ");
+  Serial.print(inR);
+  Serial.print("μs ");
+  if (inR == 0) {
+    Serial.print("(超时) ");
+  } else if (inR < RX_VALID_MIN) {
+    Serial.print("(过低) ");
+  } else if (inR > RX_VALID_MAX) {
+    Serial.print("(过高) ");
+  } else if (abs((int)inR - RC_MID) <= 25) {
+    Serial.print("(中位) ");
+  } else if (inR < RC_MID) {
+    Serial.print("(后退) ");
+  } else {
+    Serial.print("(前进) ");
+  }
+
+  // Pin 3 → 左通道
+  Serial.print("| 左(Pin3): ");
+  Serial.print(inL);
+  Serial.print("μs ");
+  if (inL == 0) {
+    Serial.print("(超时) ");
+  } else if (inL < RX_VALID_MIN) {
+    Serial.print("(过低) ");
+  } else if (inL > RX_VALID_MAX) {
+    Serial.print("(过高) ");
+  } else if (abs((int)inL - RC_MID) <= 25) {
+    Serial.print("(中位) ");
+  } else if (inL < RC_MID) {
+    Serial.print("(后退) ");
+  } else {
+    Serial.print("(前进) ");
+  }
+
+  // 显示距离上次有效更新的时间
+  Serial.print("| 距上次更新: L=");
+  Serial.print(now - lastUpdateL);
+  Serial.print("ms R=");
+  Serial.print(now - lastUpdateR);
+  Serial.print("ms");
+
+  // 故障保护检测
+  if (now - lastUpdateL > FAILSAFE_MS) {
+    Serial.print(" [左通道故障保护]");
+  }
+  if (now - lastUpdateR > FAILSAFE_MS) {
+    Serial.print(" [右通道故障保护]");
+  }
+
+  // 打印 ESC 输出对比
+  Serial.print(" | outL|outR=");
+  Serial.print(avgL);
+  Serial.print('|');
+  Serial.print(avgR);
+
+  Serial.println();
+
+  delay(5);  // 参考 original.ino 使用 5ms 延迟
+}
