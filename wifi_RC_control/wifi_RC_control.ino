@@ -29,13 +29,12 @@ WiFiServer wifiServer(server_port);
 WiFiClient rosClient;
 
 // === Pin Configuration ===
-const int CH_LEFT_IN = 2;      // RC Left channel PWM input
-const int CH_RIGHT_IN = 3;     // RC Right channel PWM input
-const int ESC_LEFT_OUT = 10;   // Left ESC signal output
+const int CH_RIGHT_IN = 2;     // RC Right channel PWM input (Pin 2)
+const int CH_LEFT_IN = 3;      // RC Left channel PWM input (Pin 3)
 const int ESC_RIGHT_OUT = 9;   // Right ESC signal output
+const int ESC_LEFT_OUT = 10;   // Left ESC signal output
 
 // === Timing Constants ===
-const unsigned long PULSE_TIMEOUT_US = 25000;        // pulseIn timeout
 const unsigned long RC_FAILSAFE_MS = 200;            // RC signal timeout
 const unsigned long WIFI_CMD_TIMEOUT_MS = 500;       // WiFi command timeout
 const unsigned long STATUS_SEND_INTERVAL_MS = 100;   // Status update rate (10Hz)
@@ -52,9 +51,47 @@ const int DEADBAND_US = 25;
 Servo escL, escR;
 
 // === State Variables ===
-// RC state
+// RC state - interrupt-based capture
+volatile unsigned long rRiseMicros = 0, rPulseMicros = 0;
+volatile unsigned long lRiseMicros = 0, lPulseMicros = 0;
 unsigned long lastRcUpdateL = 0;
 unsigned long lastRcUpdateR = 0;
+
+// RC filtering and smoothing
+int rcAvgL = ESC_MID;
+int rcAvgR = ESC_MID;
+const int FILTER_ALPHA = 20;    // Filter strength (20%)
+const int MAX_STEP_US = 10;     // Ramp limiting (10µs per cycle)
+
+// === PWM 档位分级设置 ===
+const bool ENABLE_GEAR_MODE = true;  // 是否启用档位模式（false=连续模式）
+const int NUM_GEARS = 9;             // 档位数量（含中位档）
+
+// 档位定义：9档模式（后退4档 | 中位 | 前进4档）- 每档间隔100µs
+const int GEAR_VALUES[NUM_GEARS] = {
+  1100,  // 档位1：后退最高速 (-400µs)
+  1200,  // 档位2：后退高速   (-300µs)
+  1300,  // 档位3：后退中速   (-200µs)
+  1400,  // 档位4：后退低速   (-100µs)
+  1500,  // 档位5：中位停止   (0µs)
+  1600,  // 档位6：前进低速   (+100µs)
+  1700,  // 档位7：前进中速   (+200µs)
+  1800,  // 档位8：前进高速   (+300µs)
+  1900   // 档位9：前进最高速 (+400µs)
+};
+
+// 档位切换阈值（输入信号范围划分）
+const int GEAR_THRESHOLDS[NUM_GEARS - 1] = {
+  1050,  // < 1050: 档位1
+  1150,  // 1050-1150: 档位2
+  1250,  // 1150-1250: 档位3
+  1350,  // 1250-1350: 档位4
+  1450,  // 1350-1450: 档位5 (中位)
+  1550,  // 1450-1550: 档位5, 1550-1650: 档位6
+  1650,  // 1650-1750: 档位7
+  1750   // 1750-1850: 档位8, > 1850: 档位9
+};
+
 int rcOutL = ESC_MID;
 int rcOutR = ESC_MID;
 
@@ -63,6 +100,10 @@ unsigned long lastWifiCmdMs = 0;
 int wifiOutL = ESC_MID;
 int wifiOutR = ESC_MID;
 bool haveWifiCmd = false;
+
+// WiFi filtering and smoothing
+int wifiAvgL = ESC_MID;
+int wifiAvgR = ESC_MID;
 
 // Current output
 int currentLeftUs = ESC_MID;
@@ -74,9 +115,60 @@ unsigned long lastStatusSendMs = 0;
 
 // === Helper Functions ===
 
+// Right channel interrupt handler
+void onRightChange() {
+  int level = digitalRead(CH_RIGHT_IN);
+  unsigned long now = micros();
+  if (level == HIGH) {
+    rRiseMicros = now;
+  } else {
+    unsigned long width = now - rRiseMicros;
+    // Only accept valid pulse widths (800-2200µs)
+    if (width >= 800 && width <= 2200) {
+      rPulseMicros = width;
+    }
+  }
+}
+
+// Left channel interrupt handler
+void onLeftChange() {
+  int level = digitalRead(CH_LEFT_IN);
+  unsigned long now = micros();
+  if (level == HIGH) {
+    lRiseMicros = now;
+  } else {
+    unsigned long width = now - lRiseMicros;
+    if (width >= 800 && width <= 2200) {
+      lPulseMicros = width;
+    }
+  }
+}
+
+// 将输入信号映射到档位
+int mapToGear(unsigned long inUs) {
+  if (inUs == 0) return ESC_MID; // 超时/无脉冲
+  if ((int)inUs < RX_VALID_MIN || (int)inUs > RX_VALID_MAX) return ESC_MID; // 非法范围
+  if (abs((int)inUs - 1500) <= DEADBAND_US) return ESC_MID; // 中位保持
+  
+  // 根据输入值选择档位（9档）
+  for (int i = 0; i < NUM_GEARS - 1; i++) {
+    if (inUs < GEAR_THRESHOLDS[i]) {
+      return GEAR_VALUES[i];
+    }
+  }
+  return GEAR_VALUES[NUM_GEARS - 1];  // 最高档位
+}
+
 int mapLinearToEsc(long pulseUs) {
+  if (pulseUs == 0) return ESC_MID; // Timeout/no pulse
+  
   // Out of valid range → neutral
   if (pulseUs < RX_VALID_MIN || pulseUs > RX_VALID_MAX) {
+    return ESC_MID;
+  }
+  
+  // Center deadband
+  if (abs((int)pulseUs - 1500) <= DEADBAND_US) {
     return ESC_MID;
   }
   
@@ -84,41 +176,56 @@ int mapLinearToEsc(long pulseUs) {
   long mapped = map(pulseUs, RX_VALID_MIN, RX_VALID_MAX, ESC_MIN, ESC_MAX);
   mapped = constrain(mapped, ESC_MIN, ESC_MAX);
   
-  // Apply deadband around center
-  int rxCenter = (RX_VALID_MIN + RX_VALID_MAX) / 2;
-  int distFromCenter = abs((int)pulseUs - rxCenter);
-  
-  if (distFromCenter < DEADBAND_US) {
-    return ESC_MID;
-  }
-  
   return (int)mapped;
+}
+
+// 统一映射函数：根据模式选择连续或档位映射
+int mapToEsc(unsigned long inUs) {
+  if (ENABLE_GEAR_MODE) {
+    return mapToGear(inUs);
+  } else {
+    return mapLinearToEsc(inUs);
+  }
 }
 
 void readRcInputs() {
   unsigned long now = millis();
   
-  // Read left channel
-  unsigned long inL = pulseIn(CH_LEFT_IN, HIGH, PULSE_TIMEOUT_US);
-  if (inL >= RX_VALID_MIN && inL <= RX_VALID_MAX) {
-    rcOutL = mapLinearToEsc((long)inL);
-    lastRcUpdateL = now;
-  }
+  // Read pulse widths from interrupt capture (non-blocking)
+  noInterrupts();
+  unsigned long inR = rPulseMicros;
+  unsigned long inL = lPulseMicros;
+  interrupts();
   
-  // Read right channel
-  unsigned long inR = pulseIn(CH_RIGHT_IN, HIGH, PULSE_TIMEOUT_US);
-  if (inR >= RX_VALID_MIN && inR <= RX_VALID_MAX) {
-    rcOutR = mapLinearToEsc((long)inR);
-    lastRcUpdateR = now;
-  }
+  // Update timestamp if valid
+  if (inR >= RX_VALID_MIN && inR <= RX_VALID_MAX) lastRcUpdateR = now;
+  if (inL >= RX_VALID_MIN && inL <= RX_VALID_MAX) lastRcUpdateL = now;
+  
+  // Map to ESC range (using gear or linear mode)
+  int outR = mapToEsc((long)inR);
+  int outL = mapToEsc((long)inL);
+  
+  // Apply low-pass filter
+  int filtR = (rcAvgR * (100 - FILTER_ALPHA) + outR * FILTER_ALPHA) / 100;
+  int filtL = (rcAvgL * (100 - FILTER_ALPHA) + outL * FILTER_ALPHA) / 100;
+  
+  // Apply soft-start ramp limiting
+  int deltaR = filtR - rcAvgR;
+  if (deltaR > MAX_STEP_US) deltaR = MAX_STEP_US;
+  if (deltaR < -MAX_STEP_US) deltaR = -MAX_STEP_US;
+  rcAvgR += deltaR;
+  
+  int deltaL = filtL - rcAvgL;
+  if (deltaL > MAX_STEP_US) deltaL = MAX_STEP_US;
+  if (deltaL < -MAX_STEP_US) deltaL = -MAX_STEP_US;
+  rcAvgL += deltaL;
   
   // Apply RC failsafe
-  if (now - lastRcUpdateL > RC_FAILSAFE_MS) {
-    rcOutL = ESC_MID;
-  }
-  if (now - lastRcUpdateR > RC_FAILSAFE_MS) {
-    rcOutR = ESC_MID;
-  }
+  if (now - lastRcUpdateR > RC_FAILSAFE_MS) rcAvgR = ESC_MID;
+  if (now - lastRcUpdateL > RC_FAILSAFE_MS) rcAvgL = ESC_MID;
+  
+  rcOutR = rcAvgR;
+  rcOutL = rcAvgL;
 }
 
 void handleClientConnections() {
@@ -146,8 +253,27 @@ void readWifiCommands() {
       if (inputBuffer.startsWith("C ")) {
         int leftUs = 0, rightUs = 0;
         if (sscanf(inputBuffer.c_str(), "C %d %d", &leftUs, &rightUs) == 2) {
-          wifiOutL = constrain(leftUs, ESC_MIN, ESC_MAX);
-          wifiOutR = constrain(rightUs, ESC_MIN, ESC_MAX);
+          // Constrain and store raw WiFi commands
+          int rawL = constrain(leftUs, ESC_MIN, ESC_MAX);
+          int rawR = constrain(rightUs, ESC_MIN, ESC_MAX);
+          
+          // Apply low-pass filter to WiFi inputs
+          int filtL = (wifiAvgL * (100 - FILTER_ALPHA) + rawL * FILTER_ALPHA) / 100;
+          int filtR = (wifiAvgR * (100 - FILTER_ALPHA) + rawR * FILTER_ALPHA) / 100;
+          
+          // Apply soft-start ramp limiting
+          int deltaL = filtL - wifiAvgL;
+          if (deltaL > MAX_STEP_US) deltaL = MAX_STEP_US;
+          if (deltaL < -MAX_STEP_US) deltaL = -MAX_STEP_US;
+          wifiAvgL += deltaL;
+          
+          int deltaR = filtR - wifiAvgR;
+          if (deltaR > MAX_STEP_US) deltaR = MAX_STEP_US;
+          if (deltaR < -MAX_STEP_US) deltaR = -MAX_STEP_US;
+          wifiAvgR += deltaR;
+          
+          wifiOutL = wifiAvgL;
+          wifiOutR = wifiAvgR;
           lastWifiCmdMs = millis();
           haveWifiCmd = true;
           
@@ -185,12 +311,16 @@ void determineControlMode() {
     currentMode = 0;
     currentLeftUs = rcOutL;
     currentRightUs = rcOutR;
+    
+    // Reset WiFi averages when not in use to prevent jump on mode switch
+    wifiAvgL = ESC_MID;
+    wifiAvgR = ESC_MID;
   }
 }
 
 void updateThrusters() {
-  escL.writeMicroseconds(currentLeftUs);
   escR.writeMicroseconds(currentRightUs);
+  escL.writeMicroseconds(currentLeftUs);
 }
 
 void sendStatus() {
@@ -221,11 +351,19 @@ void setup() {
   delay(2000);
   
   Serial.println("\n=== WiFi + RC Thruster Control ===");
+  Serial.print("RC Control Mode: ");
+  Serial.println(ENABLE_GEAR_MODE ? "Gear Mode (9 gears, 100µs intervals)" : "Continuous Mode");
+  Serial.println();
   
   // Configure RC input pins
-  pinMode(CH_LEFT_IN, INPUT);
   pinMode(CH_RIGHT_IN, INPUT);
+  pinMode(CH_LEFT_IN, INPUT);
   Serial.println("RC input pins configured");
+  
+  // Attach interrupts for PWM capture
+  attachInterrupt(digitalPinToInterrupt(CH_RIGHT_IN), onRightChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(CH_LEFT_IN), onLeftChange, CHANGE);
+  Serial.println("RC interrupts attached");
   
   // Configure WiFi
   WiFi.config(local_IP, gateway, subnet);
@@ -282,7 +420,7 @@ void loop() {
   // 1. Handle WiFi client connections
   handleClientConnections();
   
-  // 2. Read RC inputs (blocking but fast ~20ms max)
+  // 2. Read RC inputs (non-blocking with interrupts)
   readRcInputs();
   
   // 3. Read WiFi commands (non-blocking)
