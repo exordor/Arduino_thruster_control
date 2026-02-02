@@ -17,12 +17,71 @@
  */
 
 // === WiFi Configuration ===
-const char* ssid = "ISSE_2.4";
-const char* password = "TheAnswerIs42";
 
-IPAddress local_IP(192, 168, 50, 100);
-IPAddress gateway(192, 168, 50, 1);
-IPAddress subnet(255, 255, 255, 0);
+// WiFi network list - add all available networks here
+// System will try to connect in order until successful
+const int MAX_WIFI_NETWORKS = 5;
+
+struct WifiNetwork {
+  const char* ssid;
+  const char* password;
+  IPAddress local_ip;
+  IPAddress gateway;
+  IPAddress subnet;
+  bool use_dhcp;  // true = use DHCP, false = use static IP
+};
+
+WifiNetwork wifiNetworks[MAX_WIFI_NETWORKS] = {
+    // Network 1: IGE (static IP)
+  {
+    .ssid = "IGE-Geomatics-sense-mobile",
+    .password = "kmhxTFWNQKH-BCiBz9Co",
+    .local_ip = IPAddress(192, 168, 50, 100),
+    .gateway = IPAddress(192, 168, 50, 1),
+    .subnet = IPAddress(255, 255, 255, 0),
+    .use_dhcp = false
+  },
+  // Network 2: ISSE (static IP)
+  {
+    .ssid = "ISSE_2.4",
+    .password = "TheAnswerIs42",
+    .local_ip = IPAddress(192, 168, 50, 100),
+    .gateway = IPAddress(192, 168, 50, 1),
+    .subnet = IPAddress(255, 255, 255, 0),
+    .use_dhcp = false
+  },
+  // Network 3: Example with DHCP
+  // {
+  //   .ssid = "Your-WiFi-Name",
+  //   .password = "Your-Password",
+  //   .local_ip = IPAddress(0, 0, 0, 0),
+  //   .gateway = IPAddress(0, 0, 0, 0),
+  //   .subnet = IPAddress(0, 0, 0, 0),
+  //   .use_dhcp = true
+  // },
+  // Network 4: Another network (uncomment and configure)
+  // {
+  //   .ssid = "Another-WiFi",
+  //   .password = "password",
+  //   .local_ip = IPAddress(192, 168, 1, 100),
+  //   .gateway = IPAddress(192, 168, 1, 1),
+  //   .subnet = IPAddress(255, 255, 255, 0),
+  //   .use_dhcp = false
+  // },
+  // Network 5: Add more networks as needed (max 5)
+};
+
+// Track which network is currently connected
+int currentNetworkIndex = -1;
+
+// WiFi auto-reconnect configuration
+const unsigned long WIFI_CHECK_INTERVAL_MS = 2000;  // Check WiFi every 2 seconds
+const unsigned long WIFI_RECONNECT_DELAY_MS = 5000; // Wait 5s before reconnect attempt
+const int MAX_RECONNECT_ATTEMPTS = 3;               // Max reconnect attempts per network
+unsigned long lastWifiCheckMs = 0;
+unsigned long lastWifiDisconnectMs = 0;
+int reconnectAttemptCount = 0;
+bool reconnectInProgress = false;
 
 const unsigned int server_port = 8888;
 WiFiServer wifiServer(server_port);
@@ -103,6 +162,11 @@ unsigned long lastWifiCmdMs = 0;
 int wifiOutL = ESC_MID;
 int wifiOutR = ESC_MID;
 bool haveWifiCmd = false;
+
+// WiFi command buffer (using char array instead of String to avoid memory fragmentation)
+#define CMD_BUFFER_SIZE 64
+static char cmdBuffer[CMD_BUFFER_SIZE];
+static int cmdBufferIndex = 0;
 
 // WiFi filtering and smoothing
 int wifiAvgL = ESC_MID;
@@ -246,16 +310,17 @@ void readWifiCommands() {
     return;
   }
   
-  static String inputBuffer = "";
-  
   while (rosClient.available()) {
     char c = rosClient.read();
     
     if (c == '\n') {
+      // Null-terminate the string
+      cmdBuffer[cmdBufferIndex] = '\0';
+      
       // Process complete command
-      if (inputBuffer.startsWith("C ")) {
+      if (cmdBufferIndex > 0 && cmdBuffer[0] == 'C' && cmdBuffer[1] == ' ') {
         int leftUs = 0, rightUs = 0;
-        if (sscanf(inputBuffer.c_str(), "C %d %d", &leftUs, &rightUs) == 2) {
+        if (sscanf(cmdBuffer, "C %d %d", &leftUs, &rightUs) == 2) {
           // Constrain and store raw WiFi commands
           int rawL = constrain(leftUs, ESC_MIN, ESC_MAX);
           int rawR = constrain(rightUs, ESC_MIN, ESC_MAX);
@@ -287,11 +352,16 @@ void readWifiCommands() {
           Serial.println(wifiOutR);
         }
       }
-      inputBuffer = "";
+      // Reset buffer for next command
+      cmdBufferIndex = 0;
     } else if (c != '\r') {
-      inputBuffer += c;
-      if (inputBuffer.length() > 50) {
-        inputBuffer = "";  // Prevent overflow
+      // Add character to buffer if space available
+      if (cmdBufferIndex < CMD_BUFFER_SIZE - 1) {
+        cmdBuffer[cmdBufferIndex++] = c;
+      } else {
+        // Buffer overflow - reset
+        Serial.println("⚠ Command buffer overflow, reset");
+        cmdBufferIndex = 0;
       }
     }
   }
@@ -359,6 +429,225 @@ void sendStatus() {
   rosClient.print(statusBuf);
 }
 
+// === WiFi Multi-Network Management ===
+
+// Try to reconnect to WiFi (attempt previously connected network first)
+bool reconnectWiFi() {
+  unsigned long now = millis();
+  
+  // Wait before reconnect attempt
+  if (now - lastWifiDisconnectMs < WIFI_RECONNECT_DELAY_MS) {
+    return false;
+  }
+  
+  Serial.println("\n=== WiFi Reconnection Attempt ===");
+  
+  // Try to reconnect to the previously connected network first
+  if (currentNetworkIndex >= 0) {
+    Serial.print("Reconnecting to: ");
+    Serial.println(wifiNetworks[currentNetworkIndex].ssid);
+    
+    // Configure IP
+    if (!wifiNetworks[currentNetworkIndex].use_dhcp) {
+      WiFi.config(wifiNetworks[currentNetworkIndex].local_ip, 
+                  wifiNetworks[currentNetworkIndex].gateway, 
+                  wifiNetworks[currentNetworkIndex].subnet);
+    }
+    
+    // Disconnect first, then attempt reconnection
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(wifiNetworks[currentNetworkIndex].ssid, 
+               wifiNetworks[currentNetworkIndex].password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\n✓ Reconnected!");
+      reconnectAttemptCount = 0;
+      reconnectInProgress = false;
+      return true;
+    }
+    
+    Serial.println("\n✗ Reconnect failed, trying other networks...");
+  }
+  
+  // If reconnect to previous network failed, try all networks
+  reconnectAttemptCount++;
+  if (reconnectAttemptCount >= MAX_RECONNECT_ATTEMPTS) {
+    Serial.println("Max reconnect attempts reached. Waiting...");
+    reconnectInProgress = false;
+    reconnectAttemptCount = 0;
+    return false;
+  }
+  
+  // Try all networks in order
+  for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
+    // Skip empty entries
+    if (wifiNetworks[i].ssid == nullptr || strlen(wifiNetworks[i].ssid) == 0) {
+      continue;
+    }
+    
+    // Skip the network we just tried to reconnect to
+    if (i == currentNetworkIndex) {
+      continue;
+    }
+    
+    Serial.print("Trying network [");
+    Serial.print(i + 1);
+    Serial.print("/");
+    Serial.print(MAX_WIFI_NETWORKS);
+    Serial.print("]: ");
+    Serial.println(wifiNetworks[i].ssid);
+    
+    // Configure IP
+    if (!wifiNetworks[i].use_dhcp) {
+      WiFi.config(wifiNetworks[i].local_ip, 
+                  wifiNetworks[i].gateway, 
+                  wifiNetworks[i].subnet);
+    } else {
+      WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
+    }
+    
+    // Attempt connection
+    WiFi.begin(wifiNetworks[i].ssid, wifiNetworks[i].password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\n✓ Connected!");
+      Serial.print("  Network: ");
+      Serial.println(wifiNetworks[i].ssid);
+      Serial.print("  IP Address: ");
+      Serial.println(WiFi.localIP());
+      Serial.print("  RSSI: ");
+      Serial.print(WiFi.RSSI());
+      Serial.println(" dBm");
+      
+      currentNetworkIndex = i;
+      reconnectAttemptCount = 0;
+      reconnectInProgress = false;
+      return true;
+    }
+    
+    WiFi.disconnect();
+    delay(500);
+  }
+  
+  Serial.println("\n✗ All networks unavailable");
+  return false;
+}
+
+// Check WiFi status and trigger reconnection if needed
+void checkWiFiStatus() {
+  unsigned long now = millis();
+  
+  // Only check at intervals
+  if (now - lastWifiCheckMs < WIFI_CHECK_INTERVAL_MS) {
+    return;
+  }
+  lastWifiCheckMs = now;
+  
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+  
+  if (!wifiConnected && !reconnectInProgress) {
+    // WiFi disconnected - start reconnection process
+    if (lastWifiDisconnectMs == 0) {
+      lastWifiDisconnectMs = now;
+      Serial.println("\n⚠ WiFi link lost!");
+    }
+    
+    reconnectInProgress = true;
+    reconnectWiFi();
+  } else if (wifiConnected) {
+    // WiFi connected - reset disconnect timer
+    if (lastWifiDisconnectMs > 0) {
+      Serial.println("\n✓ WiFi link restored");
+    }
+    lastWifiDisconnectMs = 0;
+    reconnectInProgress = false;
+    reconnectAttemptCount = 0;
+  }
+}
+
+// Try to connect to WiFi networks in order until successful
+bool connectToWiFi() {
+  Serial.println("\n=== Attempting WiFi Connection ===");
+  
+  for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
+    // Skip empty entries
+    if (wifiNetworks[i].ssid == nullptr || strlen(wifiNetworks[i].ssid) == 0) {
+      continue;
+    }
+    
+    Serial.print("Trying network [");
+    Serial.print(i + 1);
+    Serial.print("/");
+    Serial.print(MAX_WIFI_NETWORKS);
+    Serial.print("]: ");
+    Serial.println(wifiNetworks[i].ssid);
+    
+    // Configure IP based on network settings
+    if (!wifiNetworks[i].use_dhcp) {
+      Serial.print("  Using static IP: ");
+      Serial.println(wifiNetworks[i].local_ip);
+      WiFi.config(wifiNetworks[i].local_ip, wifiNetworks[i].gateway, wifiNetworks[i].subnet);
+    } else {
+      Serial.println("  Using DHCP");
+      WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
+    }
+    
+    // Attempt connection
+    WiFi.begin(wifiNetworks[i].ssid, wifiNetworks[i].password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    
+    // Check if connection successful
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\n✓ Connected!");
+      Serial.print("  Network: ");
+      Serial.println(wifiNetworks[i].ssid);
+      Serial.print("  IP Address: ");
+      Serial.println(WiFi.localIP());
+      Serial.print("  Gateway: ");
+      Serial.println(WiFi.gatewayIP());
+      Serial.print("  Subnet: ");
+      Serial.println(WiFi.subnetMask());
+      Serial.print("  RSSI: ");
+      Serial.print(WiFi.RSSI());
+      Serial.println(" dBm");
+      
+      currentNetworkIndex = i;
+      return true;
+    } else {
+      Serial.println("\n✗ Connection failed");
+    }
+    
+    // Disconnect before trying next network
+    WiFi.disconnect();
+    delay(500);
+  }
+  
+  Serial.println("\n✗ All WiFi connection attempts failed");
+  currentNetworkIndex = -1;
+  return false;
+}
+
 // === Setup ===
 
 void setup() {
@@ -381,36 +670,17 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(CH_LEFT_IN), onLeftChange, CHANGE);
   Serial.println("RC interrupts attached");
   
-  // Configure WiFi
-  WiFi.config(local_IP, gateway, subnet);
-  Serial.println("Static IP configured");
+  // Connect to WiFi (try all networks in order)
+  bool wifiConnected = connectToWiFi();
   
-  // Connect to WiFi
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(ssid);
-  WiFi.begin(ssid, password);
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n✓ Connected to WiFi!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("RSSI: ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
-    
+  if (wifiConnected) {
     // Start TCP server
     wifiServer.begin();
     Serial.print("TCP Server started on port ");
     Serial.println(server_port);
+    Serial.println("Ready for WiFi control commands");
   } else {
-    Serial.println("\n✗ WiFi connection failed - RC only mode");
+    Serial.println("WiFi unavailable - Running in RC only mode");
   }
   
   // Initialize ESCs
@@ -432,6 +702,9 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+  
+  // 0. Check WiFi status and auto-reconnect if needed
+  checkWiFiStatus();
   
   // 1. Handle WiFi client connections
   handleClientConnections();
@@ -482,6 +755,11 @@ void loop() {
     Serial.print(currentMode == 1 ? "WiFi" : "RC");
     Serial.print(" | WiFi link: ");
     Serial.print(wifiLink ? "CONNECTED" : "DISCONNECTED");
+    if (wifiLink && currentNetworkIndex >= 0) {
+      Serial.print(" (");
+      Serial.print(wifiNetworks[currentNetworkIndex].ssid);
+      Serial.print(")");
+    }
     Serial.print(" | Client: ");
     Serial.print(clientLink ? "CONNECTED" : "DISCONNECTED");
     Serial.print(" | CmdAge=");
