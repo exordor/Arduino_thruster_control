@@ -168,6 +168,10 @@ bool haveWifiCmd = false;
 static char cmdBuffer[CMD_BUFFER_SIZE];
 static int cmdBufferIndex = 0;
 
+// WiFi command rate limiting (prevent excessive commands from overheating motors/ESCs)
+const unsigned long MIN_CMD_INTERVAL_MS = 100;  // Minimum 100ms between commands (max 10 commands/sec)
+unsigned long lastWifiCommandSentMs = 0;
+
 // WiFi filtering and smoothing
 int wifiAvgL = ESC_MID;
 int wifiAvgR = ESC_MID;
@@ -319,6 +323,17 @@ void readWifiCommands() {
       
       // Process complete command
       if (cmdBufferIndex > 0 && cmdBuffer[0] == 'C' && cmdBuffer[1] == ' ') {
+        // Check command rate limit
+        unsigned long now = millis();
+        if (now - lastWifiCommandSentMs < MIN_CMD_INTERVAL_MS) {
+          unsigned long waitTime = MIN_CMD_INTERVAL_MS - (now - lastWifiCommandSentMs);
+          Serial.print("⚠ Command too frequent, ignored (wait ");
+          Serial.print(waitTime);
+          Serial.println("ms)");
+          cmdBufferIndex = 0;
+          continue;
+        }
+        
         int leftUs = 0, rightUs = 0;
         if (sscanf(cmdBuffer, "C %d %d", &leftUs, &rightUs) == 2) {
           // Constrain and store raw WiFi commands
@@ -344,6 +359,7 @@ void readWifiCommands() {
           wifiOutL = wifiAvgL;
           wifiOutR = wifiAvgR;
           lastWifiCmdMs = millis();
+          lastWifiCommandSentMs = now;  // Update command rate timestamp
           haveWifiCmd = true;
           
           Serial.print("WiFi Command: Left=");
