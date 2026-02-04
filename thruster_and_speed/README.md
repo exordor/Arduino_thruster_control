@@ -32,7 +32,10 @@ A dual thruster control system with integrated flow meter sensor for Arduino UNO
 | Status update rate | 10 Hz |
 | Heartbeat interval | 500 ms |
 | UDP timeout | 2000 ms |
-| Command rate limit | 100 ms min interval |
+| **WiFi command rate limit** | **20 ms min interval (50 Hz max)** |
+| **RC deadband** | **±40 µs (joystick drift resistance)** |
+| **WiFi filter** | **100% alpha (direct control)** |
+| **RC filter** | **25% alpha (smooth)** |
 
 ## Wiring
 
@@ -68,7 +71,7 @@ The system uses two separate UDP ports for cleaner protocol separation:
 
 | Direction | Format | Purpose | Rate Limit |
 |-----------|--------|---------|-------------|
-| Client → Arduino | `C <left_us> <right_us>\n` | Thruster command | 100ms min |
+| Client → Arduino | `C <left_us> <right_us>\n` | Thruster command | **20ms min** |
 | Client → Arduino | `PING\n` | Handshake/keep-alive | No limit |
 | Arduino → Client | `S <mode> <left_us> <right_us>\n` | Thruster status | 10 Hz |
 | Arduino → Client | `F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n` | Flow data | 1 Hz |
@@ -140,6 +143,32 @@ Continuous operation:
 3. **Easy Filtering**: Can filter heartbeat traffic separately if needed
 4. **Independent Channels**: Different QoS can be applied per port
 
+## Control Characteristics
+
+### RC vs WiFi Filtering
+
+The system uses different filtering parameters for optimal performance with each input type:
+
+| Characteristic | RC (Joystick) | WiFi (UDP) |
+|----------------|---------------|-----------|
+| Filter Alpha | 25% (smooth) | 80% (fast) |
+| Max Step | 15µs/cycle | 50µs/cycle |
+| Deadband | ±40µs | N/A |
+| Purpose | Resist drift | Low latency |
+
+**Why Different?**
+- **RC inputs** have physical joystick drift, hand tremors, and signal noise → needs strong smoothing
+- **WiFi inputs** are precise digital values with no drift → can use fast, responsive filtering
+
+### Performance
+
+| Metric | RC | WiFi |
+|--------|-------|------|
+| Response Time | ~200-300ms (smooth ramp) | ~40-80ms (fast) |
+| Max Command Rate | Limited by human | 50 Hz (20ms min) |
+| Drift Resistance | High (±40µs deadband) | N/A (digital) |
+| Precision | Medium (joystick dependent) | High (exact values) |
+
 ## Control Priority
 
 1. **WiFi/UDP commands** (if receiving data)
@@ -199,6 +228,8 @@ ESCs initialized to neutral (1500 µs)
 
 === System Ready ===
 Control Priority: UDP > RC > Failsafe
+RC Filter: 25% alpha, ±40µs deadband (smooth, drift-resistant)
+WiFi Filter: 80% alpha, 20ms min interval (low latency)
 Flow Meter: D7 polling mode, 1 Hz update rate
 Heartbeat: 500ms (port 8889), Timeout: 2000ms
 ```
@@ -261,6 +292,12 @@ python3 udp_test.py --mode monitor --keep-alive
 # Interactive mode (send commands)
 python3 udp_test.py --mode interactive
 
+# 10Hz latency test (measure control delay)
+python3 udp_test.py --mode hz10 --duration 10
+
+# Thruster control test
+python3 udp_test.py --mode thruster
+
 # Heartbeat test (test for 30 seconds)
 python3 udp_test.py --mode heartbeat --duration 30
 
@@ -293,7 +330,7 @@ python3 udp_test.py --ip 192.168.50.100
 2. **Initial Handshake**: Send `PING` immediately after connection
 3. **Keep-Alive**: Send `PING` every 1 second to maintain connection
 4. **Use `select()`**: Monitor both sockets simultaneously for incoming data
-5. **Handle Rate Limiting**: Commands have 100ms minimum interval, PING does not
+5. **Handle Rate Limiting**: WiFi commands have 20ms minimum interval, PING does not
 
 ### C++ ROS Node Structure
 
@@ -321,6 +358,8 @@ void keepAliveThread() {
 
 ## Calibration
 
+### Flow Meter
+
 Modify these constants if needed:
 
 ```cpp
@@ -328,6 +367,28 @@ const float K_HZ_PER_LMIN = 5.0f;       // f = 5*Q (frequency per flow rate)
 const float PULSES_PER_L = 300.0f;      // 1L ≈ 300 pulses
 const float DIAMETER_M = 0.026f;        // 26 mm pipe diameter
 ```
+
+### Control Response Tuning
+
+The following constants can be adjusted to change control behavior:
+
+```cpp
+// WiFi (Low Latency)
+const int WIFI_FILTER_ALPHA = 80;     // Higher = faster response (20-100%)
+const int WIFI_MAX_STEP_US = 50;      // Higher = faster ramp (10-100µs)
+const unsigned long MIN_CMD_INTERVAL_MS = 20;  // Min time between commands
+
+// RC (Smooth, Drift-Resistant)
+const int RC_FILTER_ALPHA = 25;       // Lower = smoother (10-50%)
+const int RC_MAX_STEP_US = 15;        // Lower = slower ramp (5-50µs)
+const int DEADBAND_US = 40;            // Deadband around center (20-100µs)
+```
+
+**Tuning Guide:**
+- Increase `WIFI_FILTER_ALPHA` for smoother WiFi control (less jitter)
+- Increase `WIFI_MAX_STEP_US` for faster WiFi changes
+- Decrease `RC_FILTER_ALPHA` for faster RC response
+- Increase `DEADBAND_US` if joystick causes unintended movement
 
 ## Troubleshooting
 
@@ -352,9 +413,10 @@ const float DIAMETER_M = 0.026f;        // 26 mm pipe diameter
 
 ### Command rate limiting
 
-- Commands have 100ms minimum interval
+- WiFi commands have **20ms minimum interval** (max 50 Hz)
 - PING is NOT rate limited (can be sent anytime)
 - Use keep-alive mode to maintain connection
+- RC control has **separate filtering** (25% alpha, smooth) to resist joystick drift
 
 ### No flow data
 
