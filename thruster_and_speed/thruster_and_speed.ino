@@ -91,9 +91,11 @@ bool reconnectInProgress = false;
 
 // UDP Configuration
 const unsigned int UDP_PORT = 8888;         // Data port (commands, status, flow)
-const unsigned int HEARTBEAT_PORT = 8889;   // Heartbeat port (HEARTBEAT messages)
+const unsigned int HEARTBEAT_PORT = 8887;   // Heartbeat broadcast port (HEARTBEAT messages)
+const unsigned int CONTROL_PING_PORT = 8889; // Control keepalive port (PING/PONG)
 WiFiUDP udp;              // Data UDP
-WiFiUDP udpHeartbeat;      // Heartbeat UDP
+WiFiUDP udpHeartbeat;     // Heartbeat broadcast UDP
+WiFiUDP udpControlPing;   // Control ping/pong UDP
 #define UDP_BUFFER_SIZE 128
 char udpBuffer[UDP_BUFFER_SIZE];
 
@@ -114,7 +116,7 @@ const unsigned long FLOW_UPDATE_INTERVAL_MS = 1000;  // 1 Hz update rate
 // === Timing Constants ===
 const unsigned long RC_FAILSAFE_MS = 200;            // RC signal timeout
 const unsigned long UDP_TIMEOUT_MS = 2000;           // UDP timeout (2s without data = offline)
-const unsigned long HEARTBEAT_INTERVAL_MS = 500;     // Heartbeat send interval (500ms)
+const unsigned long HEARTBEAT_INTERVAL_MS = 1000;    // Heartbeat send interval (1 second, broadcast mode)
 const unsigned long WIFI_GRACE_MS = 400;             // Hold-last grace after timeout
 const int DECAY_STEP_US = 5;                         // Soft decay step toward 1500
 const unsigned long STATUS_SEND_INTERVAL_MS = 100;   // Status update rate (10Hz)
@@ -394,7 +396,7 @@ void updateFlowMeter() {
 
 // === UDP Functions ===
 
-// Send heartbeat to Jetson (on separate heartbeat port)
+// Send heartbeat to broadcast (monitoring programs can listen passively)
 void sendHeartbeat() {
   unsigned long now = millis();
   if (now - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) {
@@ -402,17 +404,33 @@ void sendHeartbeat() {
   }
   lastHeartbeatMs = now;
 
-  if (!jetsonAddrKnown) {
-    return;
-  }
-
-  // Send to heartbeat port (8889) instead of data port
-  udpHeartbeat.beginPacket(jetsonIp, HEARTBEAT_PORT);
+  // Broadcast heartbeat to all network (no need to know client address)
+  udpHeartbeat.beginPacket((uint32_t)0xFFFFFFFF, HEARTBEAT_PORT);  // 255.255.255.255
   udpHeartbeat.print("HEARTBEAT\n");
   udpHeartbeat.endPacket();
 }
 
-// Read UDP commands from Jetson
+// Read control ping on port 8889 (separate from data port)
+void readControlPing() {
+  int packetSize = udpControlPing.parsePacket();
+  if (packetSize == 0) {
+    return;
+  }
+
+  char buffer[32];
+  int len = udpControlPing.read(buffer, sizeof(buffer) - 1);
+  if (len > 0) {
+    buffer[len] = '\0';
+    if (strcmp(buffer, "PING") == 0) {
+      Serial.println("Control PING received, sending PONG");
+      udpControlPing.beginPacket(udpControlPing.remoteIP(), udpControlPing.remotePort());
+      udpControlPing.print("PONG\n");
+      udpControlPing.endPacket();
+    }
+  }
+}
+
+// Read UDP commands from Jetson (data port 8888 - C/S/F only, no PING)
 void readUdpCommands() {
   int packetSize = udp.parsePacket();
 
@@ -484,15 +502,6 @@ void readUdpCommands() {
             Serial.println(wifiOutR);
           }
         }
-      }
-
-      // Process PING command (handshake/keep-alive, no rate limit)
-      if (cmdBufferIndex > 0 && strcmp(cmdBuffer, "PING") == 0) {
-        Serial.println("UDP: PING received");
-        // Send PONG response
-        udp.beginPacket(jetsonIp, jetsonPort);
-        udp.print("PONG\n");
-        udp.endPacket();
       }
 
       // Reset buffer for next command
@@ -645,11 +654,14 @@ bool reconnectWiFi() {
       // Restart UDP servers
       udp.begin(UDP_PORT);
       udpHeartbeat.begin(HEARTBEAT_PORT);
+      udpControlPing.begin(CONTROL_PING_PORT);
       Serial.print("UDP servers restarted on ports ");
       Serial.print(UDP_PORT);
       Serial.print(" (data), ");
-      Serial.println(HEARTBEAT_PORT);
-      Serial.println(" (heartbeat)");
+      Serial.print(HEARTBEAT_PORT);
+      Serial.print(" (heartbeat), ");
+      Serial.println(CONTROL_PING_PORT);
+      Serial.println(" (control ping)");
 
       return true;
     }
@@ -721,11 +733,14 @@ bool reconnectWiFi() {
       // Start UDP servers
       udp.begin(UDP_PORT);
       udpHeartbeat.begin(HEARTBEAT_PORT);
+      udpControlPing.begin(CONTROL_PING_PORT);
       Serial.print("UDP servers started on ports ");
       Serial.print(UDP_PORT);
       Serial.print(" (data), ");
-      Serial.println(HEARTBEAT_PORT);
-      Serial.println(" (heartbeat)");
+      Serial.print(HEARTBEAT_PORT);
+      Serial.print(" (heartbeat), ");
+      Serial.println(CONTROL_PING_PORT);
+      Serial.println(" (control ping)");
 
       return true;
     }
@@ -874,10 +889,15 @@ void setup() {
     Serial.print("Data UDP server started on port ");
     Serial.println(UDP_PORT);
 
-    // Start heartbeat UDP server (heartbeat messages only)
+    // Start heartbeat broadcast UDP server
     udpHeartbeat.begin(HEARTBEAT_PORT);
-    Serial.print("Heartbeat UDP server started on port ");
+    Serial.print("Heartbeat broadcast server started on port ");
     Serial.println(HEARTBEAT_PORT);
+
+    // Start control ping UDP server
+    udpControlPing.begin(CONTROL_PING_PORT);
+    Serial.print("Control ping server started on port ");
+    Serial.println(CONTROL_PING_PORT);
     Serial.println("Ready for UDP control commands");
   } else {
     Serial.println("WiFi unavailable - Running in RC only mode");
@@ -896,7 +916,7 @@ void setup() {
   Serial.println("\n=== System Ready ===");
   Serial.println("Control Priority: UDP > RC > Failsafe");
   Serial.println("Flow Meter: D7 polling mode, 1 Hz update rate");
-  Serial.println("Heartbeat: 500ms, Timeout: 2000ms");
+  Serial.println("Heartbeat: 1s broadcast, Control PING/PONG on port 8887");
   Serial.println();
 }
 
@@ -913,6 +933,9 @@ void loop() {
 
   // 2. Read UDP commands (non-blocking)
   readUdpCommands();
+
+  // 2.5. Read control ping (separate port for keepalive)
+  readControlPing();
 
   // 3. Check Jetson online status (timeout detection)
   checkJetsonStatus();
