@@ -468,6 +468,194 @@ def heartbeat_test_mode(client: UDPTestClient, duration: int = 10):
         print(f"  Average interval: {avg_interval:.3f}s (expected: {expected_interval}s)")
 
 
+def thruster_test_mode(client: UDPTestClient):
+    """Test thruster control commands
+
+    Sends various commands and verifies status responses.
+    Tests mode switching (RC → WiFi) and thruster output.
+    """
+    print("\n=== Thruster Control Test ===")
+    print("Sending test commands and verifying status responses...\n")
+
+    # Test sequence: (left, right, expected_mode, description)
+    test_commands = [
+        (1500, 1500, 1, "Neutral - Should switch to WiFi mode"),
+        (1600, 1600, 1, "Forward - Both thrusters forward"),
+        (1400, 1400, 1, "Backward - Both thrusters backward"),
+        (1500, 1600, 1, "Turn Left - Right forward"),
+        (1600, 1500, 1, "Turn Right - Left forward"),
+        (1700, 1700, 1, "High Forward - Both thrusters high"),
+        (1300, 1300, 1, "High Backward - Both thrusters high reverse"),
+        (1500, 1500, 1, "Back to Neutral"),
+        (1100, 1900, 1, "Max differential - Left reverse, right forward"),
+        (1500, 1500, 1, "Return to Neutral"),
+    ]
+
+    passed = 0
+    failed = 0
+
+    for i, (left, right, expected_mode, description) in enumerate(test_commands):
+        print(f"[Test {i+1}/{len(test_commands)}] {description}")
+        print(f"  Sending: C {left} {right}")
+
+        # Clear latest status to verify new response
+        client.latest_status = StatusData()
+
+        # Send command
+        if not client.send_command(left, right):
+            print(f"  [FAIL] Could not send command")
+            failed += 1
+            continue
+
+        # Wait for status response (with timeout)
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            time.sleep(0.05)
+            if client.latest_status.timestamp > 0:
+                break
+
+        # Verify response
+        if client.latest_status.timestamp == 0:
+            print(f"  [WARN] No status response received")
+        else:
+            s = client.latest_status
+            mode_match = (s.mode == expected_mode)
+            left_match = (s.left_us == left)
+            right_match = (s.right_us == right)
+
+            if mode_match and left_match and right_match:
+                print(f"  [PASS] Mode={s.mode_str} L={s.left_us} R={s.right_us}us ✓")
+                passed += 1
+            else:
+                print(f"  [FAIL] Mode={s.mode_str} (expected: {'WiFi' if expected_mode==1 else 'RC'}) "
+                      f"L={s.left_us} (expected: {left}) "
+                      f"R={s.right_us} (expected: {right})")
+                failed += 1
+
+        # Delay between tests
+        time.sleep(0.3)
+
+    # Test rate limiting
+    print("\n=== Rate Limiting Test ===")
+    print("Sending 5 commands rapidly (should be rate limited to 100ms min)...")
+    start = time.time()
+    for i in range(5):
+        client.send_command(1600, 1600)
+        time.sleep(0.02)  # 20ms between commands
+    elapsed = time.time() - start
+    print(f"  Sent 5 commands in {elapsed:.3f}s (20ms intervals)")
+    print(f"  Expected minimum time: {4 * 0.100:.1f}s (100ms rate limit)")
+    if elapsed >= 0.4:
+        print(f"  [INFO] Commands appear to be rate limited correctly")
+
+    # Summary
+    print(f"\n=== Test Summary ===")
+    print(f"  Total tests: {len(test_commands)}")
+    print(f"  Passed: {passed}")
+    print(f"  Failed: {failed}")
+    print(f"  Success rate: {(passed / len(test_commands) * 100):.1f}%")
+
+    # Show final status
+    if client.latest_status.timestamp > 0:
+        s = client.latest_status
+        print(f"\n  Final Status: Mode={s.mode_str} L={s.left_us} R={s.right_us}us")
+
+
+def hz_10_test_mode(client: UDPTestClient, duration: int = 30):
+    """Send commands at 10Hz and measure latency
+
+    This test sends alternating commands at 10Hz (100ms intervals) to match
+    the Arduino's rate limit and measure actual control latency.
+    """
+    print("\n=== 10Hz Latency Test ===")
+    print(f"Sending commands at 10Hz for {duration}s...")
+    print("Commands will alternate: 1500->1600->1500->1400->1500")
+
+    import statistics
+
+    # Test sequence
+    commands = [
+        (1500, 1500, "Neutral"),
+        (1600, 1600, "Forward"),
+        (1500, 1500, "Neutral"),
+        (1400, 1400, "Backward"),
+    ]
+    cmd_index = 0
+
+    start_time = time.time()
+    sent_count = 0
+    response_times = []
+    last_command_time = 0
+    last_expected_left = 1500
+    last_expected_right = 1500
+
+    print(f"\n{'Time':<8} {'Sent':<20} {'Status':<20} {'Latency':<10} {'Delta':<10}")
+    print("-" * 75)
+
+    while time.time() - start_time < duration:
+        now = time.time()
+        elapsed = now - start_time
+
+        # Send command at 10Hz (every 100ms)
+        if elapsed - last_command_time >= 0.1:
+            left, right, desc = commands[cmd_index % len(commands)]
+            client.send_command(left, right)
+            sent_time = time.time()
+            sent_count += 1
+            last_expected_left = left
+            last_expected_right = right
+            last_command_time = elapsed
+
+            # Wait for status response
+            deadline = sent_time + 0.2  # 200ms timeout
+            response_received = False
+            latency = 0
+
+            while time.time() < deadline:
+                time.sleep(0.005)  # 5ms poll
+                if client.latest_status.timestamp > sent_time:
+                    latency = (client.latest_status.timestamp - sent_time) * 1000  # ms
+                    response_times.append(latency)
+                    response_received = True
+                    break
+
+            # Check if status matches expected
+            if response_received:
+                s = client.latest_status
+                match = (s.left_us == left and s.right_us == right)
+                match_str = "✓" if match else "✗"
+                delta = abs(s.left_us - left) + abs(s.right_us - right)
+                print(f"{elapsed:>6.1f}s  {desc:<20}  L={s.left_us} R={s.right_us:<4}  "
+                      f"{latency:>6.0f}ms  {delta:>4}µs {match_str}")
+            else:
+                print(f"{elapsed:>6.1f}s  {desc:<20}  (no response)     ---        ---")
+
+            cmd_index += 1
+
+        time.sleep(0.01)  # 10ms sleep between checks
+
+    # Summary statistics
+    print("\n=== 10Hz Test Results ===")
+    print(f"  Duration: {duration}s")
+    print(f"  Commands sent: {sent_count}")
+    print(f"  Expected rate: 10 Hz")
+    print(f"  Actual rate: {sent_count / duration:.2f} Hz")
+
+    if response_times:
+        print(f"\n  Latency Statistics:")
+        print(f"    Min: {min(response_times):.1f} ms")
+        print(f"    Max: {max(response_times):.1f} ms")
+        print(f"    Avg: {statistics.mean(response_times):.1f} ms")
+        print(f"    Median: {statistics.median(response_times):.1f} ms")
+        if len(response_times) > 1:
+            print(f"    Std Dev: {statistics.stdev(response_times):.1f} ms")
+
+    # Final status
+    if client.latest_status.timestamp > 0:
+        s = client.latest_status
+        print(f"\n  Final Status: Mode={s.mode_str} L={s.left_us} R={s.right_us}us")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Test UDP communication with Arduino thruster controller"
@@ -491,9 +679,9 @@ def main():
     )
     parser.add_argument(
         '--mode',
-        choices=['interactive', 'heartbeat', 'monitor'],
+        choices=['interactive', 'heartbeat', 'thruster', 'hz10', 'monitor'],
         default='monitor',
-        help='Test mode: interactive (send commands), heartbeat (test only), monitor (listen only)'
+        help='Test mode: interactive (send commands), heartbeat (test only), thruster (control test), hz10 (10Hz latency test), monitor (listen only)'
     )
     parser.add_argument(
         '--duration',
@@ -576,6 +764,36 @@ def main():
 
         elif args.mode == 'heartbeat':
             heartbeat_test_mode(client, args.duration)
+
+        elif args.mode == 'thruster':
+            # Wait for first heartbeat
+            print("\n[WAIT] Waiting for first heartbeat...")
+            for _ in range(50):  # Wait up to 5 seconds
+                if client.is_arduino_online():
+                    break
+                time.sleep(0.1)
+
+            if client.is_arduino_online():
+                print("[OK] Arduino is online! Starting thruster test...\n")
+                thruster_test_mode(client)
+            else:
+                print("[WARN] No heartbeat received. Check Arduino is powered and connected.")
+                print("       Verify Arduino IP address and network connectivity.")
+
+        elif args.mode == 'hz10':
+            # Wait for first heartbeat
+            print("\n[WAIT] Waiting for first heartbeat...")
+            for _ in range(50):  # Wait up to 5 seconds
+                if client.is_arduino_online():
+                    break
+                time.sleep(0.1)
+
+            if client.is_arduino_online():
+                print("[OK] Arduino is online! Starting 10Hz latency test...\n")
+                hz_10_test_mode(client, args.duration)
+            else:
+                print("[WARN] No heartbeat received. Check Arduino is powered and connected.")
+                print("       Verify Arduino IP address and network connectivity.")
 
         elif args.mode == 'monitor':
             print("\n=== Monitor Mode ===")
