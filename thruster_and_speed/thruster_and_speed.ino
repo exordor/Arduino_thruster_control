@@ -125,7 +125,7 @@ const int RX_VALID_MAX = 2000;
 const int ESC_MIN = 1100;
 const int ESC_MID = 1500;
 const int ESC_MAX = 1900;
-const int DEADBAND_US = 25;
+const int DEADBAND_US = 40;  // Increased deadband to resist joystick drift (±40µs around center)
 
 // === Servo Objects ===
 Servo escL, escR;
@@ -137,11 +137,14 @@ volatile unsigned long lRiseMicros = 0, lPulseMicros = 0;
 unsigned long lastRcUpdateL = 0;
 unsigned long lastRcUpdateR = 0;
 
-// RC filtering and smoothing
+// RC filtering and smoothing (separate from WiFi for different response characteristics)
 int rcAvgL = ESC_MID;
 int rcAvgR = ESC_MID;
-const int FILTER_ALPHA = 20;    // Filter strength (20%)
-const int MAX_STEP_US = 10;     // Ramp limiting (10µs per cycle)
+const int RC_FILTER_ALPHA = 25;       // RC filter (25% = smooth, resists joystick drift)
+const int RC_MAX_STEP_US = 15;        // RC ramp limiting (15µs per cycle = smooth RC control)
+
+const int WIFI_FILTER_ALPHA = 80;     // WiFi filter (80% = low latency, fast response)
+const int WIFI_MAX_STEP_US = 50;      // WiFi ramp limiting (50µs per cycle = fast WiFi control)
 
 // === PWM Gear Mode Settings ===
 const bool ENABLE_GEAR_MODE = true;  // Enable gear mode (false=continuous)
@@ -196,7 +199,7 @@ static char cmdBuffer[CMD_BUFFER_SIZE];
 static int cmdBufferIndex = 0;
 
 // WiFi command rate limiting (prevent excessive commands from overheating motors/ESCs)
-const unsigned long MIN_CMD_INTERVAL_MS = 100;  // Minimum 100ms between commands (max 10 commands/sec)
+const unsigned long MIN_CMD_INTERVAL_MS = 20;  // Minimum 20ms between commands (max 50 commands/sec) - LOW LATENCY
 unsigned long lastWifiCommandSentMs = 0;
 
 // WiFi filtering and smoothing
@@ -312,19 +315,19 @@ void readRcInputs() {
   int outR = mapToEsc((long)inR);
   int outL = mapToEsc((long)inL);
 
-  // Apply low-pass filter
-  int filtR = (rcAvgR * (100 - FILTER_ALPHA) + outR * FILTER_ALPHA) / 100;
-  int filtL = (rcAvgL * (100 - FILTER_ALPHA) + outL * FILTER_ALPHA) / 100;
+  // Apply low-pass filter (RC uses smoother filtering to resist joystick drift)
+  int filtR = (rcAvgR * (100 - RC_FILTER_ALPHA) + outR * RC_FILTER_ALPHA) / 100;
+  int filtL = (rcAvgL * (100 - RC_FILTER_ALPHA) + outL * RC_FILTER_ALPHA) / 100;
 
-  // Apply soft-start ramp limiting
+  // Apply soft-start ramp limiting (RC uses slower ramp for smooth control)
   int deltaR = filtR - rcAvgR;
-  if (deltaR > MAX_STEP_US) deltaR = MAX_STEP_US;
-  if (deltaR < -MAX_STEP_US) deltaR = -MAX_STEP_US;
+  if (deltaR > RC_MAX_STEP_US) deltaR = RC_MAX_STEP_US;
+  if (deltaR < -RC_MAX_STEP_US) deltaR = -RC_MAX_STEP_US;
   rcAvgR += deltaR;
 
   int deltaL = filtL - rcAvgL;
-  if (deltaL > MAX_STEP_US) deltaL = MAX_STEP_US;
-  if (deltaL < -MAX_STEP_US) deltaL = -MAX_STEP_US;
+  if (deltaL > RC_MAX_STEP_US) deltaL = RC_MAX_STEP_US;
+  if (deltaL < -RC_MAX_STEP_US) deltaL = -RC_MAX_STEP_US;
   rcAvgL += deltaL;
 
   // Apply RC failsafe
@@ -453,19 +456,19 @@ void readUdpCommands() {
             int rawL = constrain(leftUs, ESC_MIN, ESC_MAX);
             int rawR = constrain(rightUs, ESC_MIN, ESC_MAX);
 
-            // Apply low-pass filter to WiFi inputs
-            int filtL = (wifiAvgL * (100 - FILTER_ALPHA) + rawL * FILTER_ALPHA) / 100;
-            int filtR = (wifiAvgR * (100 - FILTER_ALPHA) + rawR * FILTER_ALPHA) / 100;
+            // Apply low-pass filter to WiFi inputs (WiFi uses low-latency filtering)
+            int filtL = (wifiAvgL * (100 - WIFI_FILTER_ALPHA) + rawL * WIFI_FILTER_ALPHA) / 100;
+            int filtR = (wifiAvgR * (100 - WIFI_FILTER_ALPHA) + rawR * WIFI_FILTER_ALPHA) / 100;
 
-            // Apply soft-start ramp limiting
+            // Apply soft-start ramp limiting (WiFi uses faster ramp for responsive control)
             int deltaL = filtL - wifiAvgL;
-            if (deltaL > MAX_STEP_US) deltaL = MAX_STEP_US;
-            if (deltaL < -MAX_STEP_US) deltaL = -MAX_STEP_US;
+            if (deltaL > WIFI_MAX_STEP_US) deltaL = WIFI_MAX_STEP_US;
+            if (deltaL < -WIFI_MAX_STEP_US) deltaL = -WIFI_MAX_STEP_US;
             wifiAvgL += deltaL;
 
             int deltaR = filtR - wifiAvgR;
-            if (deltaR > MAX_STEP_US) deltaR = MAX_STEP_US;
-            if (deltaR < -MAX_STEP_US) deltaR = -MAX_STEP_US;
+            if (deltaR > WIFI_MAX_STEP_US) deltaR = WIFI_MAX_STEP_US;
+            if (deltaR < -WIFI_MAX_STEP_US) deltaR = -WIFI_MAX_STEP_US;
             wifiAvgR += deltaR;
 
             // Smoothed WiFi outputs
