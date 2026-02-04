@@ -656,6 +656,182 @@ def hz_10_test_mode(client: UDPTestClient, duration: int = 30):
         print(f"\n  Final Status: Mode={s.mode_str} L={s.left_us} R={s.right_us}us")
 
 
+def steady_test_mode(client: UDPTestClient, hold_duration: int = 5):
+    """Test continuous rotation with steady speeds
+
+    This test sends constant commands for longer durations to test if thrusters
+    can maintain continuous rotation without the "stopping feeling" caused by
+    frequent direction changes in the 10Hz test.
+
+    Sequence: Neutral -> Forward -> Neutral -> Backward -> Neutral
+    Each command is held for the specified duration (default 5 seconds).
+    """
+    print("\n=== Steady Speed Test (Continuous Rotation) ===")
+    print(f"Holding each command for {hold_duration}s...")
+    print("This tests if thrusters can maintain continuous rotation.")
+    print("\nSequence: Neutral -> Forward -> Neutral -> Backward -> Neutral")
+
+    # Test sequence: steady commands with long hold times
+    commands = [
+        (1500, 1500, "Neutral", "Stop"),
+        (1600, 1600, "Forward", "Forward spin"),
+        (1700, 1700, "Forward High", "Faster forward"),
+        (1500, 1500, "Neutral", "Stop"),
+        (1400, 1400, "Backward", "Backward spin"),
+        (1300, 1300, "Backward High", "Faster backward"),
+        (1500, 1500, "Neutral", "Stop"),
+    ]
+
+    print(f"\n{'Time':<8} {'Command':<16} {'Description':<16} {'Status':<20} {'Delta':<10}")
+    print("-" * 85)
+
+    start_time = time.time()
+
+    for left, right, name, desc in commands:
+        cmd_start = time.time()
+        elapsed_total = cmd_start - start_time
+
+        # Send command
+        client.send_command(left, right)
+        print(f"{elapsed_total:>6.1f}s  {name:<16}  {desc:<16}  ", end="", flush=True)
+
+        # Wait for thruster to respond and stabilize
+        time.sleep(0.2)  # Initial response delay
+
+        # Monitor status during hold period
+        status_samples = []
+        monitor_start = time.time()
+
+        while time.time() - monitor_start < hold_duration:
+            if client.latest_status.timestamp > cmd_start:
+                s = client.latest_status
+                delta = abs(s.left_us - left) + abs(s.right_us - right)
+                status_samples.append((time.time(), s.left_us, s.right_us, delta))
+            time.sleep(0.1)
+
+        # Show final status after hold period
+        if status_samples:
+            _, final_left, final_right, final_delta = status_samples[-1]
+            # Calculate stability (how much it varied during hold)
+            deltas = [s[3] for s in status_samples]
+            avg_delta = sum(deltas) / len(deltas)
+            max_delta = max(deltas)
+
+            print(f"L={final_left} R={final_right:<4}  ", end="")
+            if final_delta < 10:
+                print(f"Target ✓     {final_delta:>4}µs", end="")
+            elif final_delta < 50:
+                print(f"Close ~      {final_delta:>4}µs", end="")
+            else:
+                print(f"Off target   {final_delta:>4}µs", end="")
+
+            # Show stability info
+            if len(status_samples) > 1:
+                print(f"  (avg: {avg_delta:.0f}µs, max: {max_delta}µs)")
+            else:
+                print()
+        else:
+            print("(no response)")
+
+    # Final summary
+    total_time = time.time() - start_time
+    print(f"\n=== Steady Test Complete ===")
+    print(f"  Total duration: {total_time:.1f}s")
+    print(f"  Commands tested: {len(commands)}")
+    print(f"  Hold time per command: {hold_duration}s")
+
+    # Final status
+    if client.latest_status.timestamp > 0:
+        s = client.latest_status
+        print(f"\n  Final Status: Mode={s.mode_str} L={s.left_us} R={s.right_us}us")
+
+
+def hold_test_mode(client: UDPTestClient, left: int, right: int, duration: int = 20):
+    """Hold a single command for specified duration
+
+    This test sends one command and holds it to test continuous rotation.
+    Useful for testing if thrusters can maintain steady speed without interruption.
+
+    Args:
+        client: UDP test client
+        left: Left ESC pulse width (1100-1900µs)
+        right: Right ESC pulse width (1100-1900µs)
+        duration: Hold duration in seconds
+    """
+    # Determine command description
+    if left == 1500 and right == 1500:
+        desc = "Neutral (Stop)"
+    elif left > 1500 and right > 1500:
+        desc = f"Forward ({left}µs)"
+    elif left < 1500 and right < 1500:
+        desc = f"Backward ({left}µs)"
+    else:
+        desc = f"Custom (L={left}, R={right})"
+
+    print(f"\n=== Hold Test: {desc} ===")
+    print(f"Holding C {left} {right} for {duration}s...")
+    print("Command sent repeatedly at 10Hz (every 100ms) to maintain target.")
+    print("Monitoring thruster response during hold period.\n")
+
+    cmd_time = time.time()
+    last_send_time = 0
+    send_interval = 0.1  # Send command at 10Hz (every 100ms)
+    commands_sent = 0
+
+    # Monitor status during hold period
+    print(f"\n{'Time':<8} {'Status':<25} {'Delta':<10} {'Mode':<8}")
+    print("-" * 60)
+
+    samples = []
+    while time.time() - cmd_time < duration:
+        # Send command repeatedly
+        now = time.time()
+        if now - last_send_time >= send_interval:
+            client.send_command(left, right)
+            last_send_time = now
+            commands_sent += 1
+
+        time.sleep(0.05)  # 50ms sleep
+        if client.latest_status.timestamp > cmd_time:
+            s = client.latest_status
+            delta = abs(s.left_us - left) + abs(s.right_us - right)
+            elapsed = now - cmd_time
+            samples.append((elapsed, s.left_us, s.right_us, delta, s.mode_str))
+
+            # Print status every second
+            if len(samples) == 1 or int(elapsed) > int(samples[-2][0]) if len(samples) > 1 else False:
+                mode_display = "WiFi" if s.mode_str == "WiFi" else "RC"
+                print(f"{elapsed:>6.1f}s  L={s.left_us} R={s.right_us:<4}  {delta:>4}µs    {mode_display}")
+
+    # Summary statistics
+    if samples:
+        deltas = [s[3] for s in samples]
+        avg_delta = sum(deltas) / len(deltas)
+        min_delta = min(deltas)
+        max_delta = max(deltas)
+
+        print(f"\n=== Hold Test Results ===")
+        print(f"  Command: C {left} {right}")
+        print(f"  Duration: {duration}s")
+        print(f"  Commands sent: {commands_sent} (every {send_interval}s)")
+        print(f"  Samples collected: {len(samples)}")
+        print(f"\n  Delta from target:")
+        print(f"    Average: {avg_delta:.1f}µs")
+        print(f"    Min: {min_delta}µs")
+        print(f"    Max: {max_delta}µs")
+
+        final_left, final_right = samples[-1][1], samples[-1][2]
+        print(f"\n  Final output: L={final_left} R={final_right}µs")
+
+        # Check if stable
+        if max_delta < 10:
+            print(f"  ✓ Stable: Reached and maintained target")
+        elif avg_delta < 50:
+            print(f"  ~ Close: Average within 50µs of target")
+        else:
+            print(f"  ✗ Unstable: Average delta {avg_delta:.1f}µs from target")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Test UDP communication with Arduino thruster controller"
@@ -679,9 +855,21 @@ def main():
     )
     parser.add_argument(
         '--mode',
-        choices=['interactive', 'heartbeat', 'thruster', 'hz10', 'monitor'],
+        choices=['interactive', 'heartbeat', 'thruster', 'hz10', 'steady', 'hold', 'monitor'],
         default='monitor',
-        help='Test mode: interactive (send commands), heartbeat (test only), thruster (control test), hz10 (10Hz latency test), monitor (listen only)'
+        help='Test mode: interactive (send commands), heartbeat (test only), thruster (control test), hz10 (10Hz latency test), steady (continuous rotation test), hold (hold single command), monitor (listen only)'
+    )
+    parser.add_argument(
+        '--left',
+        type=int,
+        default=1800,
+        help='Left ESC pulse width for hold mode (default: 1800)'
+    )
+    parser.add_argument(
+        '--right',
+        type=int,
+        default=1800,
+        help='Right ESC pulse width for hold mode (default: 1800)'
     )
     parser.add_argument(
         '--duration',
@@ -791,6 +979,36 @@ def main():
             if client.is_arduino_online():
                 print("[OK] Arduino is online! Starting 10Hz latency test...\n")
                 hz_10_test_mode(client, args.duration)
+            else:
+                print("[WARN] No heartbeat received. Check Arduino is powered and connected.")
+                print("       Verify Arduino IP address and network connectivity.")
+
+        elif args.mode == 'steady':
+            # Wait for first heartbeat
+            print("\n[WAIT] Waiting for first heartbeat...")
+            for _ in range(50):  # Wait up to 5 seconds
+                if client.is_arduino_online():
+                    break
+                time.sleep(0.1)
+
+            if client.is_arduino_online():
+                print("[OK] Arduino is online! Starting steady speed test...\n")
+                steady_test_mode(client, args.duration)
+            else:
+                print("[WARN] No heartbeat received. Check Arduino is powered and connected.")
+                print("       Verify Arduino IP address and network connectivity.")
+
+        elif args.mode == 'hold':
+            # Wait for first heartbeat
+            print("\n[WAIT] Waiting for first heartbeat...")
+            for _ in range(50):  # Wait up to 5 seconds
+                if client.is_arduino_online():
+                    break
+                time.sleep(0.1)
+
+            if client.is_arduino_online():
+                print("[OK] Arduino is online! Starting hold test...\n")
+                hold_test_mode(client, args.left, args.right, args.duration)
             else:
                 print("[WARN] No heartbeat received. Check Arduino is powered and connected.")
                 print("       Verify Arduino IP address and network connectivity.")
