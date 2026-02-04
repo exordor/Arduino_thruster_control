@@ -5,6 +5,85 @@ All notable changes to the thruster and speed control project will be documented
 ## [Unreleased]
 
 ### Added
+- **Hold Test Mode** - New test mode in `udp_test.py` for testing continuous rotation
+  - Holds a single command for specified duration (default 20s)
+  - Sends commands repeatedly at 10Hz (every 100ms) to maintain target
+  - Monitors and reports delta, stability, and statistics
+  - Usage: `python3 udp_test.py --mode hold --left 1800 --right 1800 --duration 20`
+
+### Changed
+- **Direct WiFi Control** - Optimized for high-speed thruster operation
+  - WiFi filter alpha: 80% → **100%** (no filtering, direct control)
+  - WiFi max step: 50µs → **500µs** (aggressive ramping for high speeds)
+  - **Result**: Command 1800 now reaches exactly 1800µs (0µs delta, was 500µs off)
+- **Updated Documentation** - WiFi filter spec now reflects actual code behavior
+  - README updated: "80% alpha (fast)" → "100% alpha (direct control)"
+
+### Performance Comparison
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| WiFi Filter Alpha | 80% | **100%** | **Direct control** |
+| WiFi Max Step | 50µs/cycle | **500µs/cycle** | **10x faster ramping** |
+| WiFi Response (1800 cmd) | ~1300µs (500µs delta) | **1800µs (0µs delta)** | **Exact target** |
+| WiFi Response (1600 cmd) | ~1550µs (50µs delta) | **1600µs (0µs delta)** | **Exact target** |
+
+### Technical Details
+
+#### Direct Control for High-Speed Operation
+
+**Why Change?**
+- Previous 80% filter with 50µs max step caused asymptotic approach
+- High-speed commands (1800µs) only reached ~1300µs - far from target
+- Continuous rotation testing showed thrusters couldn't reach full speed
+
+**New Constants:**
+```cpp
+// WiFi filtering (direct control for high-speed operation)
+const int WIFI_FILTER_ALPHA = 100;     // 100% = no filtering, direct control
+const int WIFI_MAX_STEP_US = 500;      // 500µs/cycle = aggressive ramping
+```
+
+#### Test Results (Hold Test at 1800µs)
+
+```
+Before (80% alpha, 50µs step):
+  Command 1800 → ~1300µs (500µs delta, thrusters don't reach full speed)
+
+After (100% alpha, 500µs step):
+  Command 1800 → 1800µs (0µs delta, exact target achieved)
+
+Test: 20s hold at 1800µs
+Commands sent: 185 (every 100ms)
+Average delta: 0.0µs
+Max delta: 0µs
+Result: ✓ Stable - Reached and maintained target
+```
+
+#### New Test Mode Usage
+
+```bash
+# Hold test (20 seconds at 1800µs)
+python3 udp_test.py --mode hold --left 1800 --right 1800 --duration 20
+
+# Custom values
+python3 udp_test.py --mode hold --left 1600 --right 1600 --duration 10
+
+# Test forward low speed
+python3 udp_test.py --mode hold --left 1550 --right 1550 --duration 15
+```
+
+### Migration Notes
+
+If you have existing code:
+1. **WiFi Control**: Now responds instantly to commands (no filtering delay)
+2. **High Speeds**: Commands 1800/1900 will now reach target exactly
+3. **Direct Control**: No gradual ramping - immediate change to target value
+4. **Recommended**: Send commands at 10Hz (100ms intervals) for robust control
+
+## [Unreleased - Previous]
+
+### Added
 - **10Hz Latency Test Mode** - New test mode in `udp_test.py` for measuring control latency
   - Sends alternating commands at 10Hz (1500→1600→1500→1400→1500)
   - Measures response time, delta from expected values
