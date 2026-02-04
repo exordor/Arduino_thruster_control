@@ -143,8 +143,8 @@ int rcAvgR = ESC_MID;
 const int RC_FILTER_ALPHA = 25;       // RC filter (25% = smooth, resists joystick drift)
 const int RC_MAX_STEP_US = 15;        // RC ramp limiting (15µs per cycle = smooth RC control)
 
-const int WIFI_FILTER_ALPHA = 80;     // WiFi filter (80% = low latency, fast response)
-const int WIFI_MAX_STEP_US = 50;      // WiFi ramp limiting (50µs per cycle = fast WiFi control)
+const int WIFI_FILTER_ALPHA = 100;    // WiFi filter (100% = no filtering, direct control)
+const int WIFI_MAX_STEP_US = 500;     // WiFi ramp limiting (500µs per cycle = aggressive WiFi control for high speeds)
 
 // === PWM Gear Mode Settings ===
 const bool ENABLE_GEAR_MODE = true;  // Enable gear mode (false=continuous)
