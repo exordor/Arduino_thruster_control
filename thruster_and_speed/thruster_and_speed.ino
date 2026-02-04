@@ -1,30 +1,32 @@
 #include <WiFiS3.h>
 #include <Servo.h>
+#include <WiFiUdp.h>
 
 /*
- * Dual Thrusters Control + Flow Meter - WiFi + RC Hybrid Mode
+ * Dual Thrusters Control + Flow Meter - WiFi UDP + RC Hybrid Mode
  *
  * Control Priority:
- *   1. WiFi/ROS commands (if connected and receiving)
- *   2. RC receiver (if WiFi timeout or disconnected)
+ *   1. WiFi/UDP commands (if receiving data)
+ *   2. RC receiver (if UDP timeout)
  *   3. Neutral failsafe (if both unavailable)
  *
- * Communication:
- *   - WiFi: TCP Server on port 8888
+ * Communication (UDP):
+ *   - Port: 8888
  *   - Command format: C <left_us> <right_us>\n
  *   - Status format: S <mode> <left_us> <right_us>\n
  *   - Flow data format: F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n
+ *   - Heartbeat: Arduino sends "HEARTBEAT\n" every 500ms
+ *   - Ping/Pong: PING -> PONG (for handshake/keep-alive, no rate limit)
  *   - Mode: 0=RC, 1=WiFi
  *
  * Jetson Programs:
- *   - Thruster program: Sends C commands, receives S messages
- *   - Speed program: Receives F messages only
+ *   - Single bridge node: Sends C commands, receives S and F messages
+ *   - Connection detected by timeout: 2s without data = offline
  */
 
 // === WiFi Configuration ===
 
 // WiFi network list - add all available networks here
-// System will try to connect in order until successful
 const int MAX_WIFI_NETWORKS = 5;
 
 struct WifiNetwork {
@@ -87,9 +89,13 @@ unsigned long lastWifiDisconnectMs = 0;
 int reconnectAttemptCount = 0;
 bool reconnectInProgress = false;
 
-const unsigned int server_port = 8888;
-WiFiServer wifiServer(server_port);
-WiFiClient rosClient;
+// UDP Configuration
+const unsigned int UDP_PORT = 8888;         // Data port (commands, status, flow)
+const unsigned int HEARTBEAT_PORT = 8889;   // Heartbeat port (HEARTBEAT messages)
+WiFiUDP udp;              // Data UDP
+WiFiUDP udpHeartbeat;      // Heartbeat UDP
+#define UDP_BUFFER_SIZE 128
+char udpBuffer[UDP_BUFFER_SIZE];
 
 // === Pin Configuration ===
 const int CH_RIGHT_IN = 2;     // RC Right channel PWM input (Pin 2)
@@ -107,7 +113,8 @@ const unsigned long FLOW_UPDATE_INTERVAL_MS = 1000;  // 1 Hz update rate
 
 // === Timing Constants ===
 const unsigned long RC_FAILSAFE_MS = 200;            // RC signal timeout
-const unsigned long WIFI_CMD_TIMEOUT_MS = 1000;      // WiFi command timeout (more tolerant)
+const unsigned long UDP_TIMEOUT_MS = 2000;           // UDP timeout (2s without data = offline)
+const unsigned long HEARTBEAT_INTERVAL_MS = 500;     // Heartbeat send interval (500ms)
 const unsigned long WIFI_GRACE_MS = 400;             // Hold-last grace after timeout
 const int DECAY_STEP_US = 5;                         // Soft decay step toward 1500
 const unsigned long STATUS_SEND_INTERVAL_MS = 100;   // Status update rate (10Hz)
@@ -169,13 +176,21 @@ const int GEAR_THRESHOLDS[NUM_GEARS - 1] = {
 int rcOutL = ESC_MID;
 int rcOutR = ESC_MID;
 
-// === WiFi State ===
+// === UDP/WiFi State ===
 unsigned long lastWifiCmdMs = 0;
+unsigned long lastUdpReceiveMs = 0;    // Last time any UDP data received
+unsigned long lastHeartbeatMs = 0;     // Last heartbeat sent
 int wifiOutL = ESC_MID;
 int wifiOutR = ESC_MID;
 bool haveWifiCmd = false;
+bool jetsonOnline = false;             // Derived from timeout
 
-// WiFi command buffer (using char array instead of String to avoid memory fragmentation)
+// Jetson's IP and Port (for sending data back)
+IPAddress jetsonIp;
+uint16_t jetsonPort = 0;
+bool jetsonAddrKnown = false;
+
+// WiFi command buffer
 #define CMD_BUFFER_SIZE 64
 static char cmdBuffer[CMD_BUFFER_SIZE];
 static int cmdBufferIndex = 0;
@@ -374,9 +389,155 @@ void updateFlowMeter() {
   }
 }
 
-// Send flow data via TCP
-void sendFlowData() {
-  if (!rosClient.connected()) {
+// === UDP Functions ===
+
+// Send heartbeat to Jetson (on separate heartbeat port)
+void sendHeartbeat() {
+  unsigned long now = millis();
+  if (now - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) {
+    return;
+  }
+  lastHeartbeatMs = now;
+
+  if (!jetsonAddrKnown) {
+    return;
+  }
+
+  // Send to heartbeat port (8889) instead of data port
+  udpHeartbeat.beginPacket(jetsonIp, HEARTBEAT_PORT);
+  udpHeartbeat.print("HEARTBEAT\n");
+  udpHeartbeat.endPacket();
+}
+
+// Read UDP commands from Jetson
+void readUdpCommands() {
+  int packetSize = udp.parsePacket();
+
+  if (packetSize == 0) {
+    return;
+  }
+
+  // Data received - update timestamp
+  lastUdpReceiveMs = millis();
+
+  // Save sender's address for responses
+  jetsonIp = udp.remoteIP();
+  jetsonPort = udp.remotePort();
+  jetsonAddrKnown = true;
+
+  // Read data
+  int len = udp.read(udpBuffer, sizeof(udpBuffer) - 1);
+  if (len <= 0) {
+    return;
+  }
+  udpBuffer[len] = '\0';
+
+  // Process command buffer (may contain multiple commands)
+  for (int i = 0; i < len; i++) {
+    char c = udpBuffer[i];
+
+    if (c == '\n') {
+      // Null-terminate the command
+      cmdBuffer[cmdBufferIndex] = '\0';
+
+      // Process complete command
+      if (cmdBufferIndex > 0 && cmdBuffer[0] == 'C' && cmdBuffer[1] == ' ') {
+        // Check command rate limit (only for C commands)
+        unsigned long now = millis();
+        if (now - lastWifiCommandSentMs < MIN_CMD_INTERVAL_MS) {
+          // Rate limited - skip this C command, but still check for PING below
+        } else {
+          int leftUs = 0, rightUs = 0;
+          if (sscanf(cmdBuffer, "C %d %d", &leftUs, &rightUs) == 2) {
+            // Constrain and store raw WiFi commands
+            int rawL = constrain(leftUs, ESC_MIN, ESC_MAX);
+            int rawR = constrain(rightUs, ESC_MIN, ESC_MAX);
+
+            // Apply low-pass filter to WiFi inputs
+            int filtL = (wifiAvgL * (100 - FILTER_ALPHA) + rawL * FILTER_ALPHA) / 100;
+            int filtR = (wifiAvgR * (100 - FILTER_ALPHA) + rawR * FILTER_ALPHA) / 100;
+
+            // Apply soft-start ramp limiting
+            int deltaL = filtL - wifiAvgL;
+            if (deltaL > MAX_STEP_US) deltaL = MAX_STEP_US;
+            if (deltaL < -MAX_STEP_US) deltaL = -MAX_STEP_US;
+            wifiAvgL += deltaL;
+
+            int deltaR = filtR - wifiAvgR;
+            if (deltaR > MAX_STEP_US) deltaR = MAX_STEP_US;
+            if (deltaR < -MAX_STEP_US) deltaR = -MAX_STEP_US;
+            wifiAvgR += deltaR;
+
+            // Smoothed WiFi outputs
+            wifiOutL = wifiAvgL;
+            wifiOutR = wifiAvgR;
+            lastWifiCmdMs = millis();
+            lastWifiCommandSentMs = now;
+            haveWifiCmd = true;
+
+            Serial.print("UDP Command: Left=");
+            Serial.print(wifiOutL);
+            Serial.print(" Right=");
+            Serial.println(wifiOutR);
+          }
+        }
+      }
+
+      // Process PING command (handshake/keep-alive, no rate limit)
+      if (cmdBufferIndex > 0 && strcmp(cmdBuffer, "PING") == 0) {
+        Serial.println("UDP: PING received");
+        // Send PONG response
+        udp.beginPacket(jetsonIp, jetsonPort);
+        udp.print("PONG\n");
+        udp.endPacket();
+      }
+
+      // Reset buffer for next command
+      cmdBufferIndex = 0;
+    } else if (c != '\r') {
+      // Add character to buffer if space available
+      if (cmdBufferIndex < CMD_BUFFER_SIZE - 1) {
+        cmdBuffer[cmdBufferIndex++] = c;
+      } else {
+        // Buffer overflow - reset
+        cmdBufferIndex = 0;
+      }
+    }
+  }
+}
+
+// Check if Jetson is online via timeout detection
+void checkJetsonStatus() {
+  unsigned long now = millis();
+  jetsonOnline = (now - lastUdpReceiveMs) < UDP_TIMEOUT_MS;
+}
+
+// Send status via UDP
+void sendUdpStatus() {
+  if (!jetsonAddrKnown || !jetsonOnline) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastStatusSendMs < STATUS_SEND_INTERVAL_MS) {
+    return;
+  }
+
+  lastStatusSendMs = now;
+
+  // Send status: "S <mode> <left_us> <right_us>\n"
+  char statusBuf[50];
+  snprintf(statusBuf, sizeof(statusBuf), "S %d %d %d\n",
+           currentMode, currentLeftUs, currentRightUs);
+
+  udp.beginPacket(jetsonIp, jetsonPort);
+  udp.print(statusBuf);
+  udp.endPacket();
+}
+
+// Send flow data via UDP
+void sendUdpFlowData() {
+  if (!jetsonAddrKnown || !jetsonOnline) {
     return;
   }
 
@@ -390,119 +551,33 @@ void sendFlowData() {
   snprintf(flowBuf, sizeof(flowBuf), "F %.2f %.2f %.4f %.3f\n",
            flowFreqHz, flowLmin, flowVelocity, totalLiters);
 
-  rosClient.print(flowBuf);
-}
-
-// === WiFi Functions ===
-
-void handleClientConnections() {
-  if (!rosClient.connected()) {
-    rosClient = wifiServer.available();
-    if (rosClient) {
-      Serial.println("New WiFi client connected!");
-      haveWifiCmd = false;  // Reset command flag
-    }
-  }
-}
-
-void readWifiCommands() {
-  if (!rosClient.connected()) {
-    return;
-  }
-
-  while (rosClient.available()) {
-    char c = rosClient.read();
-
-    if (c == '\n') {
-      // Null-terminate the string
-      cmdBuffer[cmdBufferIndex] = '\0';
-
-      // Process complete command
-      if (cmdBufferIndex > 0 && cmdBuffer[0] == 'C' && cmdBuffer[1] == ' ') {
-        // Check command rate limit
-        unsigned long now = millis();
-        if (now - lastWifiCommandSentMs < MIN_CMD_INTERVAL_MS) {
-          unsigned long waitTime = MIN_CMD_INTERVAL_MS - (now - lastWifiCommandSentMs);
-          Serial.print("Command too frequent, ignored (wait ");
-          Serial.print(waitTime);
-          Serial.println("ms)");
-          cmdBufferIndex = 0;
-          continue;
-        }
-
-        int leftUs = 0, rightUs = 0;
-        if (sscanf(cmdBuffer, "C %d %d", &leftUs, &rightUs) == 2) {
-          // Constrain and store raw WiFi commands
-          int rawL = constrain(leftUs, ESC_MIN, ESC_MAX);
-          int rawR = constrain(rightUs, ESC_MIN, ESC_MAX);
-
-          // Apply low-pass filter to WiFi inputs
-          int filtL = (wifiAvgL * (100 - FILTER_ALPHA) + rawL * FILTER_ALPHA) / 100;
-          int filtR = (wifiAvgR * (100 - FILTER_ALPHA) + rawR * FILTER_ALPHA) / 100;
-
-          // Apply soft-start ramp limiting
-          int deltaL = filtL - wifiAvgL;
-          if (deltaL > MAX_STEP_US) deltaL = MAX_STEP_US;
-          if (deltaL < -MAX_STEP_US) deltaL = -MAX_STEP_US;
-          wifiAvgL += deltaL;
-
-          int deltaR = filtR - wifiAvgR;
-          if (deltaR > MAX_STEP_US) deltaR = MAX_STEP_US;
-          if (deltaR < -MAX_STEP_US) deltaR = -MAX_STEP_US;
-          wifiAvgR += deltaR;
-
-          // Smoothed WiFi outputs
-          wifiOutL = wifiAvgL;
-          wifiOutR = wifiAvgR;
-          lastWifiCmdMs = millis();
-          lastWifiCommandSentMs = now;  // Update command rate timestamp
-          haveWifiCmd = true;
-
-          Serial.print("WiFi Command: Left=");
-          Serial.print(wifiOutL);
-          Serial.print(" Right=");
-          Serial.println(wifiOutR);
-        }
-      }
-      // Reset buffer for next command
-      cmdBufferIndex = 0;
-    } else if (c != '\r') {
-      // Add character to buffer if space available
-      if (cmdBufferIndex < CMD_BUFFER_SIZE - 1) {
-        cmdBuffer[cmdBufferIndex++] = c;
-      } else {
-        // Buffer overflow - reset
-        Serial.println("Command buffer overflow, reset");
-        cmdBufferIndex = 0;
-      }
-    }
-  }
+  udp.beginPacket(jetsonIp, jetsonPort);
+  udp.print(flowBuf);
+  udp.endPacket();
 }
 
 void determineControlMode() {
   unsigned long now = millis();
 
-  // Check if WiFi commands are active and recent
-  bool wifiActive = haveWifiCmd &&
-                    rosClient.connected() &&
-                    (now - lastWifiCmdMs < WIFI_CMD_TIMEOUT_MS);
+  // Check if Jetson is online and commands are active
+  bool udpActive = jetsonOnline && haveWifiCmd && (now - lastWifiCmdMs < UDP_TIMEOUT_MS);
 
-  if (wifiActive) {
-    // WiFi has priority, preserve smoothing state
+  if (udpActive) {
+    // UDP has priority, preserve smoothing state
     currentMode = 1;
     currentLeftUs = wifiOutL;
     currentRightUs = wifiOutR;
   } else {
-    // No recent WiFi command — apply grace hold then soft decay
-    unsigned long age = haveWifiCmd ? (now - lastWifiCmdMs) : WIFI_CMD_TIMEOUT_MS + WIFI_GRACE_MS + 1;
-    if (age <= WIFI_CMD_TIMEOUT_MS + WIFI_GRACE_MS) {
-      // Hold last WiFi filtered values, decay toward neutral
-      currentMode = 1; // still treat as WiFi during grace
+    // No recent UDP command — apply grace hold then soft decay
+    unsigned long age = haveWifiCmd ? (now - lastWifiCmdMs) : UDP_TIMEOUT_MS + WIFI_GRACE_MS + 1;
+    if (age <= UDP_TIMEOUT_MS + WIFI_GRACE_MS) {
+      // Hold last UDP filtered values, decay toward neutral
+      currentMode = 1;
       currentLeftUs = wifiOutL;
       currentRightUs = wifiOutR;
       if (currentLeftUs > ESC_MID) currentLeftUs -= DECAY_STEP_US; else if (currentLeftUs < ESC_MID) currentLeftUs += DECAY_STEP_US;
       if (currentRightUs > ESC_MID) currentRightUs -= DECAY_STEP_US; else if (currentRightUs < ESC_MID) currentRightUs += DECAY_STEP_US;
-      // Keep wifiAvg tracking the decayed values to avoid jumps when WiFi resumes
+      // Keep wifiAvg tracking the decayed values to avoid jumps when UDP resumes
       wifiAvgL = currentLeftUs;
       wifiAvgR = currentRightUs;
       wifiOutL = wifiAvgL;
@@ -519,26 +594,6 @@ void determineControlMode() {
 void updateThrusters() {
   escR.writeMicroseconds(currentRightUs);
   escL.writeMicroseconds(currentLeftUs);
-}
-
-void sendStatus() {
-  if (!rosClient.connected()) {
-    return;
-  }
-
-  unsigned long now = millis();
-  if (now - lastStatusSendMs < STATUS_SEND_INTERVAL_MS) {
-    return;
-  }
-
-  lastStatusSendMs = now;
-
-  // Send status: "S <mode> <left_us> <right_us>\n"
-  char statusBuf[50];
-  snprintf(statusBuf, sizeof(statusBuf), "S %d %d %d\n",
-           currentMode, currentLeftUs, currentRightUs);
-
-  rosClient.print(statusBuf);
 }
 
 // === WiFi Multi-Network Management ===
@@ -583,6 +638,16 @@ bool reconnectWiFi() {
       Serial.println("\nReconnected!");
       reconnectAttemptCount = 0;
       reconnectInProgress = false;
+
+      // Restart UDP servers
+      udp.begin(UDP_PORT);
+      udpHeartbeat.begin(HEARTBEAT_PORT);
+      Serial.print("UDP servers restarted on ports ");
+      Serial.print(UDP_PORT);
+      Serial.print(" (data), ");
+      Serial.println(HEARTBEAT_PORT);
+      Serial.println(" (heartbeat)");
+
       return true;
     }
 
@@ -649,6 +714,16 @@ bool reconnectWiFi() {
       currentNetworkIndex = i;
       reconnectAttemptCount = 0;
       reconnectInProgress = false;
+
+      // Start UDP servers
+      udp.begin(UDP_PORT);
+      udpHeartbeat.begin(HEARTBEAT_PORT);
+      Serial.print("UDP servers started on ports ");
+      Serial.print(UDP_PORT);
+      Serial.print(" (data), ");
+      Serial.println(HEARTBEAT_PORT);
+      Serial.println(" (heartbeat)");
+
       return true;
     }
 
@@ -767,7 +842,7 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
 
-  Serial.println("\n=== WiFi + RC Thruster Control + Flow Meter ===");
+  Serial.println("\n=== WiFi UDP + RC Thruster Control + Flow Meter ===");
   Serial.print("RC Control Mode: ");
   Serial.println(ENABLE_GEAR_MODE ? "Gear Mode (9 gears, 100µs intervals)" : "Continuous Mode");
   Serial.println();
@@ -791,11 +866,16 @@ void setup() {
   bool wifiConnected = connectToWiFi();
 
   if (wifiConnected) {
-    // Start TCP server
-    wifiServer.begin();
-    Serial.print("TCP Server started on port ");
-    Serial.println(server_port);
-    Serial.println("Ready for WiFi control commands");
+    // Start data UDP server (commands, status, flow)
+    udp.begin(UDP_PORT);
+    Serial.print("Data UDP server started on port ");
+    Serial.println(UDP_PORT);
+
+    // Start heartbeat UDP server (heartbeat messages only)
+    udpHeartbeat.begin(HEARTBEAT_PORT);
+    Serial.print("Heartbeat UDP server started on port ");
+    Serial.println(HEARTBEAT_PORT);
+    Serial.println("Ready for UDP control commands");
   } else {
     Serial.println("WiFi unavailable - Running in RC only mode");
   }
@@ -811,8 +891,9 @@ void setup() {
   delay(2000);
 
   Serial.println("\n=== System Ready ===");
-  Serial.println("Control Priority: WiFi > RC > Failsafe");
+  Serial.println("Control Priority: UDP > RC > Failsafe");
   Serial.println("Flow Meter: D7 polling mode, 1 Hz update rate");
+  Serial.println("Heartbeat: 500ms, Timeout: 2000ms");
   Serial.println();
 }
 
@@ -824,39 +905,41 @@ void loop() {
   // 0. Check WiFi status and auto-reconnect if needed
   checkWiFiStatus();
 
-  // 1. Handle WiFi client connections
-  handleClientConnections();
-
-  // 2. Read RC inputs (non-blocking with interrupts)
+  // 1. Read RC inputs (non-blocking with interrupts)
   readRcInputs();
 
-  // 3. Read WiFi commands (non-blocking)
-  readWifiCommands();
+  // 2. Read UDP commands (non-blocking)
+  readUdpCommands();
+
+  // 3. Check Jetson online status (timeout detection)
+  checkJetsonStatus();
 
   // 4. Update flow meter (polling)
   updateFlowMeter();
 
-  // 5. Determine control mode and outputs
+  // 5. Send heartbeat (500ms)
+  sendHeartbeat();
+
+  // 6. Determine control mode and outputs
   determineControlMode();
 
-  // 6. Update thrusters
+  // 7. Update thrusters
   updateThrusters();
 
-  // 7. Send status to WiFi client (10 Hz)
-  sendStatus();
+  // 8. Send status to Jetson (10 Hz)
+  sendUdpStatus();
 
-  // 8. Send flow data to WiFi client (1 Hz)
-  sendFlowData();
+  // 9. Send flow data to Jetson (1 Hz)
+  sendUdpFlowData();
 
-  // 9. Connection state transitions (WiFi link vs client connection)
+  // 10. Connection state transitions
   bool wifiLink = (WiFi.status() == WL_CONNECTED);
-  bool clientLink = rosClient.connected();
   static bool prevWifiLink = false;
-  static bool prevClientLink = false;
+  static bool prevJetsonOnline = false;
   static bool stateInit = false;
   if (!stateInit) {
     prevWifiLink = wifiLink;
-    prevClientLink = clientLink;
+    prevJetsonOnline = jetsonOnline;
     stateInit = true;
   }
   if (wifiLink != prevWifiLink) {
@@ -864,28 +947,35 @@ void loop() {
     Serial.println(wifiLink ? "CONNECTED" : "DISCONNECTED");
     prevWifiLink = wifiLink;
   }
-  if (clientLink != prevClientLink) {
-    Serial.print("Client ");
-    Serial.println(clientLink ? "CONNECTED" : "DISCONNECTED");
-    prevClientLink = clientLink;
+  if (jetsonOnline != prevJetsonOnline) {
+    Serial.print("Jetson: ");
+    Serial.println(jetsonOnline ? "ONLINE" : "OFFLINE");
+    prevJetsonOnline = jetsonOnline;
   }
 
-  // 10. Print debug status every 5 seconds
+  // 11. Print debug status every 5 seconds
   static unsigned long lastDebugMs = 0;
   if (now - lastDebugMs > 5000) {
     lastDebugMs = now;
 
     Serial.print("Mode: ");
-    Serial.print(currentMode == 1 ? "WiFi" : "RC");
-    Serial.print(" | WiFi link: ");
+    Serial.print(currentMode == 1 ? "UDP" : "RC");
+    Serial.print(" | WiFi: ");
     Serial.print(wifiLink ? "CONNECTED" : "DISCONNECTED");
     if (wifiLink && currentNetworkIndex >= 0) {
       Serial.print(" (");
       Serial.print(wifiNetworks[currentNetworkIndex].ssid);
       Serial.print(")");
     }
-    Serial.print(" | Client: ");
-    Serial.print(clientLink ? "CONNECTED" : "DISCONNECTED");
+    Serial.print(" | Jetson: ");
+    Serial.print(jetsonOnline ? "ONLINE" : "OFFLINE");
+    if (jetsonAddrKnown) {
+      Serial.print(" (");
+      Serial.print(jetsonIp);
+      Serial.print(":");
+      Serial.print(jetsonPort);
+      Serial.print(")");
+    }
     Serial.print(" | L=");
     Serial.print(currentLeftUs);
     Serial.print(" R=");
