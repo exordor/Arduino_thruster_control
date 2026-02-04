@@ -41,7 +41,15 @@ WifiNetwork wifiNetworks[MAX_WIFI_NETWORKS] = {
     .subnet = IPAddress(255, 255, 255, 0),
     .use_dhcp = false
   },
-  // Network 2: ISSE (static IP)
+  {
+    .ssid = "GL-MT1300-a42",
+    .password = "goodlife",
+    .local_ip = IPAddress(192, 168, 50, 100),
+    .gateway = IPAddress(192, 168, 50, 1),
+    .subnet = IPAddress(255, 255, 255, 0),
+    .use_dhcp = false
+  },
+  // Network 3: ISSE (static IP)
   {
     .ssid = "ISSE_2.4",
     .password = "TheAnswerIs42",
