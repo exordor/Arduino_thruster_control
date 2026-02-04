@@ -420,6 +420,12 @@ void readControlPing() {
   // Any data on control ping port counts as activity for online status
   lastUdpReceiveMs = millis();
 
+  // Learn client address from PING - this is where we'll send status/flow data
+  // This allows Arduino to automatically send data without requiring a C command first
+  jetsonIp = udpControlPing.remoteIP();
+  jetsonPort = udpControlPing.remotePort();
+  jetsonAddrKnown = true;
+
   char buffer[32];
   int len = udpControlPing.read(buffer, sizeof(buffer) - 1);
   if (len > 0) {
