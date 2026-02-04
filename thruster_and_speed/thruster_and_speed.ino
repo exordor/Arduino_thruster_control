@@ -417,6 +417,9 @@ void readControlPing() {
     return;
   }
 
+  // Any data on control ping port counts as activity for online status
+  lastUdpReceiveMs = millis();
+
   char buffer[32];
   int len = udpControlPing.read(buffer, sizeof(buffer) - 1);
   if (len > 0) {
