@@ -44,3 +44,8 @@ Desktop.ini
 
 # Temporary files
 *.tmp
+*.log
+*.cache
+*.pid
+*.seed
+*.pid.lock
