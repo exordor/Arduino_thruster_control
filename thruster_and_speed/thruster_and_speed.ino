@@ -916,7 +916,7 @@ void setup() {
   Serial.println("\n=== System Ready ===");
   Serial.println("Control Priority: UDP > RC > Failsafe");
   Serial.println("Flow Meter: D7 polling mode, 1 Hz update rate");
-  Serial.println("Heartbeat: 1s broadcast, Control PING/PONG on port 8887");
+  Serial.println("Heartbeat: 1s broadcast on port 8887, Control PING/PONG on port 8889");
   Serial.println();
 }
 
