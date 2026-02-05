@@ -12,18 +12,22 @@
  *
  * Communication (UDP):
  *   - Arduino Listen: Port 8888 (C commands)
+ *   - Arduino Listen: Port 8889 (PING heartbeat from Jetson)
  *   - Arduino Send to: 192.168.50.200:28888 (S status, F flow)
- *   - Arduino Send to: 192.168.50.200:28887 (HEARTBEAT to Jetson)
- *   - Arduino Send to: 192.168.50.200:28889 (HEARTBEAT to Monitor)
+ *   - Arduino Send to: 192.168.50.200:28887 (HEARTBEAT to Jetson, when online)
+ *   - Arduino Send to: 192.168.50.200:28889 (HEARTBEAT to Monitor, when online) [optional]
+ *   - Arduino Broadcast: 192.168.50.255:8889 (HEARTBEAT broadcast when WiFi connected)
  *   - Command format: C <left_us> <right_us>\n
+ *   - Ping format: PING\n (Jetson heartbeat to Arduino on 8889)
  *   - Status format: S <mode> <left_us> <right_us>\n
  *   - Flow data format: F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n
  *   - Heartbeat: Arduino sends "HEARTBEAT\n" every 1s to both ports
  *   - Mode: 0=RC, 1=WiFi
  *
  * Jetson Programs:
- *   - Control node: Sends C commands on 8888, receives S/F on 28888, HEARTBEAT on 28887
- *   - Monitor node: Receives HEARTBEAT on 28889
+ *   - Control node: Sends C commands on 8888, sends PING on 8889,
+ *                   receives S/F on 28888, HEARTBEAT on 28887
+ *   - Monitor node: Receives HEARTBEAT on 28889 (optional)
  *   - Connection detected by timeout: 2s without data = offline
  */
 
@@ -85,7 +89,7 @@ bool reconnectInProgress = false;
 
 // UDP Configuration
 const unsigned int UDP_PORT = 8888;         // Data port (commands, status, flow)
-const unsigned int HEARTBEAT_PORT = 8887;   // Heartbeat port
+const unsigned int HEARTBEAT_PORT = 8889;   // Heartbeat port (PING in, broadcast out)
 WiFiUDP udp;              // Data UDP
 WiFiUDP udpHeartbeat;     // Heartbeat UDP
 #define UDP_BUFFER_SIZE 128
@@ -97,6 +101,8 @@ const IPAddress JETSON_IP(192, 168, 50, 200);  // Jetson IP address
 const uint16_t JETSON_PORT = 28888;              // Jetson data port
 const uint16_t JETSON_HEARTBEAT_PORT = 28887;    // Jetson heartbeat port
 const uint16_t MONITOR_HEARTBEAT_PORT = 28889;   // Monitor heartbeat port
+const IPAddress HEARTBEAT_BROADCAST_IP(192, 168, 50, 255); // Subnet broadcast
+const bool ENABLE_HEARTBEAT_BROADCAST = true;
 
 // === Pin Configuration ===
 const int CH_RIGHT_IN = 2;     // RC Right channel PWM input (Pin 2)
@@ -116,7 +122,7 @@ const unsigned long FLOW_SEND_INTERVAL_MS = 200;      // Flow UDP send rate (5 H
 // === Timing Constants ===
 const unsigned long RC_FAILSAFE_MS = 200;            // RC signal timeout
 const unsigned long UDP_TIMEOUT_MS = 2000;           // UDP timeout (2s without data = offline)
-const unsigned long JETSON_ONLINE_TIMEOUT_MS = 2000; // Jetson online if any UDP seen recently
+const unsigned long JETSON_ONLINE_TIMEOUT_MS = 2000; // Jetson online if ping/command seen recently
 const unsigned long HEARTBEAT_INTERVAL_MS = 1000;    // Heartbeat send interval (1 second, broadcast mode)
 const unsigned long WIFI_GRACE_MS = 400;             // Hold-last grace after timeout
 const int DECAY_STEP_US = 5;                         // Soft decay step toward 1500
@@ -185,6 +191,7 @@ int rcOutR = ESC_MID;
 // === UDP/WiFi State ===
 unsigned long lastWifiCmdMs = 0;
 unsigned long lastUdpReceiveMs = 0;    // Last time any UDP data received
+unsigned long lastJetsonPingMs = 0;    // Last time Jetson ping/command received
 unsigned long lastHeartbeatMs = 0;     // Last heartbeat sent
 int wifiOutL = ESC_MID;
 int wifiOutR = ESC_MID;
@@ -224,7 +231,7 @@ double totalLiters = 0.0;
 // === Helper Functions ===
 
 inline bool isJetsonOnline(unsigned long now) {
-  return (lastUdpReceiveMs > 0) && (now - lastUdpReceiveMs < JETSON_ONLINE_TIMEOUT_MS);
+  return (lastJetsonPingMs > 0) && (now - lastJetsonPingMs < JETSON_ONLINE_TIMEOUT_MS);
 }
 
 // Right channel interrupt handler
@@ -411,21 +418,26 @@ void sendHeartbeat() {
   if (WiFi.status() != WL_CONNECTED) {
     return;
   }
-  // Avoid blocking sends when Jetson is offline
-  if (!isJetsonOnline(now)) {
-    return;
-  }
   lastHeartbeatMs = now;
 
-  // Send heartbeat directly to Jetson
-  udpHeartbeat.beginPacket(JETSON_IP, JETSON_HEARTBEAT_PORT);
-  udpHeartbeat.print("HEARTBEAT\n");
-  udpHeartbeat.endPacket();
+  // Broadcast heartbeat so Jetson can detect Arduino without sending first
+  if (ENABLE_HEARTBEAT_BROADCAST) {
+    udpHeartbeat.beginPacket(HEARTBEAT_BROADCAST_IP, HEARTBEAT_PORT);
+    udpHeartbeat.print("HEARTBEAT\n");
+    udpHeartbeat.endPacket();
+  }
 
-  // Send heartbeat to monitor program
-  udpHeartbeat.beginPacket(JETSON_IP, MONITOR_HEARTBEAT_PORT);
-  udpHeartbeat.print("HEARTBEAT\n");
-  udpHeartbeat.endPacket();
+  // Send unicast heartbeats only when Jetson is online to avoid blocking
+  if (isJetsonOnline(now)) {
+    udpHeartbeat.beginPacket(JETSON_IP, JETSON_HEARTBEAT_PORT);
+    udpHeartbeat.print("HEARTBEAT\n");
+    udpHeartbeat.endPacket();
+
+    // Optional: Monitor heartbeat (disabled)
+    // udpHeartbeat.beginPacket(JETSON_IP, MONITOR_HEARTBEAT_PORT);
+    // udpHeartbeat.print("HEARTBEAT\n");
+    // udpHeartbeat.endPacket();
+  }
 }
 
 // Read UDP commands from Jetson (data port 8888)
@@ -488,6 +500,7 @@ void readUdpCommands() {
             lastWifiCmdMs = millis();
             lastWifiCommandSentMs = now;
             haveWifiCmd = true;
+            lastJetsonPingMs = now;
 
             Serial.print("UDP Command: Left=");
             Serial.print(wifiOutL);
@@ -508,6 +521,40 @@ void readUdpCommands() {
         cmdBufferIndex = 0;
       }
     }
+  }
+}
+
+// Read heartbeat ping from Jetson (heartbeat port 8889)
+void readHeartbeatPing() {
+  int packetSize = udpHeartbeat.parsePacket();
+  if (packetSize == 0) {
+    return;
+  }
+
+  IPAddress remote = udpHeartbeat.remoteIP();
+
+  // Read data
+  int len = udpHeartbeat.read(udpBuffer, sizeof(udpBuffer) - 1);
+  if (len <= 0) {
+    return;
+  }
+  udpBuffer[len] = '\0';
+
+  // Trim CR/LF
+  for (int i = 0; i < len; i++) {
+    if (udpBuffer[i] == '\r' || udpBuffer[i] == '\n') {
+      udpBuffer[i] = '\0';
+      break;
+    }
+  }
+
+  // Ignore our own broadcast packets
+  if (remote == WiFi.localIP()) {
+    return;
+  }
+
+  if (strcmp(udpBuffer, "PING") == 0 || strcmp(udpBuffer, "P") == 0) {
+    lastJetsonPingMs = millis();
   }
 }
 
@@ -919,7 +966,8 @@ void setup() {
   Serial.println("Control Priority: UDP > RC > Failsafe");
   Serial.println("Flow Meter: D7 polling mode, 1 Hz update rate");
   Serial.println("UDP: Listen 8888, Send S/F to 192.168.50.200:28888");
-  Serial.println("     HEARTBEAT to 192.168.50.200:28887 (Jetson), 28889 (Monitor)");
+  Serial.println("     HEARTBEAT broadcast to 192.168.50.255:8889");
+  Serial.println("     HEARTBEAT unicast to 192.168.50.200:28887 (Jetson)");
   Serial.println();
 }
 
@@ -943,37 +991,40 @@ void loop() {
   // 4. Read UDP commands (may block!)
   readUdpCommands();
 
-  // 5. Poll again after UDP read (critical - UDP can block)
+  // 5. Read heartbeat ping (UDP 8889)
+  readHeartbeatPing();
+
+  // 6. Poll again after UDP read (critical - UDP can block)
   pollFlowSensor();
 
-  // 6. Send heartbeat (may block!)
+  // 7. Send heartbeat (may block!)
   sendHeartbeat();
 
-  // 7. Poll again after heartbeat
+  // 8. Poll again after heartbeat
   pollFlowSensor();
 
-  // 8. Determine control mode and outputs (fast)
+  // 9. Determine control mode and outputs (fast)
   determineControlMode();
 
-  // 9. Update thrusters (fast)
+  // 10. Update thrusters (fast)
   updateThrusters();
 
-  // 10. Send status to Jetson (may block!)
+  // 11. Send status to Jetson (may block!)
   sendUdpStatus();
 
-  // 11. Poll again after status send
+  // 12. Poll again after status send
   pollFlowSensor();
 
-  // 12. Send flow data to Jetson (may block!)
+  // 13. Send flow data to Jetson (may block!)
   sendUdpFlowData();
 
-  // 13. Final poll before loop restart
+  // 14. Final poll before loop restart
   pollFlowSensor();
 
-  // 14. Calculate flow data (do this once per loop)
+  // 15. Calculate flow data (do this once per loop)
   calculateFlowData(now);
 
-  // 15. Connection state transitions (fast)
+  // 16. Connection state transitions (fast)
   bool wifiLink = (WiFi.status() == WL_CONNECTED);
   static bool prevWifiLink = false;
   static bool stateInit = false;
