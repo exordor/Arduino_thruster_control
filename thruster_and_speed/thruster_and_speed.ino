@@ -11,16 +11,17 @@
  *   3. Neutral failsafe (if both unavailable)
  *
  * Communication (UDP):
- *   - Port: 8888
+ *   - Arduino Listen: Port 8888 (C commands)
+ *   - Arduino Send to: 192.168.50.164:28888 (S status, F flow)
+ *   - Arduino Send to: 192.168.50.164:28887 (HEARTBEAT)
  *   - Command format: C <left_us> <right_us>\n
  *   - Status format: S <mode> <left_us> <right_us>\n
  *   - Flow data format: F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n
- *   - Heartbeat: Arduino sends "HEARTBEAT\n" every 500ms
- *   - Ping/Pong: PING -> PONG (for handshake/keep-alive, no rate limit)
+ *   - Heartbeat: Arduino sends "HEARTBEAT\n" every 1s
  *   - Mode: 0=RC, 1=WiFi
  *
  * Jetson Programs:
- *   - Single bridge node: Sends C commands, receives S and F messages
+ *   - Single bridge node: Sends C commands on 8888, receives S/F on 28888, HEARTBEAT on 28887
  *   - Connection detected by timeout: 2s without data = offline
  */
 
@@ -65,16 +66,7 @@ WifiNetwork wifiNetworks[MAX_WIFI_NETWORKS] = {
     .subnet = IPAddress(255, 255, 255, 0),
     .use_dhcp = false
   },
-  // Network 4: Example with DHCP
-  // {
-  //   .ssid = "Your-WiFi-Name",
-  //   .password = "Your-Password",
-  //   .local_ip = IPAddress(0, 0, 0, 0),
-  //   .gateway = IPAddress(0, 0, 0, 0),
-  //   .subnet = IPAddress(0, 0, 0, 0),
-  //   .use_dhcp = true
-  // },
-  // Network 5: Add more networks as needed (max 5)
+  // Network 4: Add more networks as needed (max 5)
 };
 
 // Track which network is currently connected
@@ -395,20 +387,6 @@ void calculateFlowData(unsigned long now) {
     double pulsesThisWindow = (double)changes / 2.0;
     totalLiters += pulsesThisWindow / PULSES_PER_L;
 
-    // Debug output to Serial (DISABLED for performance - causes ~15ms delay)
-    // Uncomment for debugging only
-    /*
-    Serial.print("Flow: ");
-    Serial.print(freqHz, 2);
-    Serial.print(" Hz, ");
-    Serial.print(flowLmin, 2);
-    Serial.print(" L/min, ");
-    Serial.print(velocity, 4);
-    Serial.print(" m/s, Total: ");
-    Serial.print(totalLiters, 3);
-    Serial.println(" L");
-    */
-
     lastFlowCalcMs = now;
   }
 }
@@ -460,7 +438,7 @@ void readUdpCommands() {
         // Check command rate limit (only for C commands)
         unsigned long now = millis();
         if (now - lastWifiCommandSentMs < MIN_CMD_INTERVAL_MS) {
-          // Rate limited - skip this C command, but still check for PING below
+          // Rate limited - skip this C command
         } else {
           int leftUs = 0, rightUs = 0;
           if (sscanf(cmdBuffer, "C %d %d", &leftUs, &rightUs) == 2) {
@@ -893,7 +871,7 @@ void setup() {
   Serial.println("\n=== System Ready ===");
   Serial.println("Control Priority: UDP > RC > Failsafe");
   Serial.println("Flow Meter: D7 polling mode, 1 Hz update rate");
-  Serial.println("Heartbeat: 1s broadcast on port 8887, Control PING/PONG on port 8889");
+  Serial.println("UDP: Listen 8888, Send S/F to 192.168.50.164:28888, HEARTBEAT to 192.168.50.164:28887");
   Serial.println();
 }
 
@@ -970,39 +948,4 @@ void loop() {
     Serial.println(jetsonOnline ? "ONLINE" : "OFFLINE");
     prevJetsonOnline = jetsonOnline;
   }
-
-  // 11. Print debug status every 5 seconds (DISABLED for performance)
-  // Uncomment for debugging only
-  /*
-  static unsigned long lastDebugMs = 0;
-  if (now - lastDebugMs > 5000) {
-    lastDebugMs = now;
-
-    Serial.print("Mode: ");
-    Serial.print(currentMode == 1 ? "UDP" : "RC");
-    Serial.print(" | WiFi: ");
-    Serial.print(wifiLink ? "CONNECTED" : "DISCONNECTED");
-    if (wifiLink && currentNetworkIndex >= 0) {
-      Serial.print(" (");
-      Serial.print(wifiNetworks[currentNetworkIndex].ssid);
-      Serial.print(")");
-    }
-    Serial.print(" | Jetson: ");
-    Serial.print(jetsonOnline ? "ONLINE" : "OFFLINE");
-    Serial.print(" (");
-    Serial.print(JETSON_IP);
-    Serial.print(":");
-    Serial.print(JETSON_PORT);
-    Serial.print(")");
-    Serial.print(" | L=");
-    Serial.print(currentLeftUs);
-    Serial.print(" R=");
-    Serial.print(currentRightUs);
-    Serial.print(" | Flow: ");
-    Serial.print(flowLmin, 2);
-    Serial.print(" L/min, Total: ");
-    Serial.print(totalLiters, 3);
-    Serial.println(" L");
-  }
-  */
 }
