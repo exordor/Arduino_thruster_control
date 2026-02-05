@@ -13,15 +13,17 @@
  * Communication (UDP):
  *   - Arduino Listen: Port 8888 (C commands)
  *   - Arduino Send to: 192.168.50.164:28888 (S status, F flow)
- *   - Arduino Send to: 192.168.50.164:28887 (HEARTBEAT)
+ *   - Arduino Send to: 192.168.50.164:28887 (HEARTBEAT to Jetson)
+ *   - Arduino Send to: 192.168.50.164:28889 (HEARTBEAT to Monitor)
  *   - Command format: C <left_us> <right_us>\n
  *   - Status format: S <mode> <left_us> <right_us>\n
  *   - Flow data format: F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n
- *   - Heartbeat: Arduino sends "HEARTBEAT\n" every 1s
+ *   - Heartbeat: Arduino sends "HEARTBEAT\n" every 1s to both ports
  *   - Mode: 0=RC, 1=WiFi
  *
  * Jetson Programs:
- *   - Single bridge node: Sends C commands on 8888, receives S/F on 28888, HEARTBEAT on 28887
+ *   - Control node: Sends C commands on 8888, receives S/F on 28888, HEARTBEAT on 28887
+ *   - Monitor node: Receives HEARTBEAT on 28889
  *   - Connection detected by timeout: 2s without data = offline
  */
 
@@ -94,6 +96,7 @@ char udpBuffer[UDP_BUFFER_SIZE];
 const IPAddress JETSON_IP(192, 168, 50, 164);  // Jetson IP address
 const uint16_t JETSON_PORT = 28888;              // Jetson data port
 const uint16_t JETSON_HEARTBEAT_PORT = 28887;    // Jetson heartbeat port
+const uint16_t MONITOR_HEARTBEAT_PORT = 28889;   // Monitor heartbeat port
 
 // === Pin Configuration ===
 const int CH_RIGHT_IN = 2;     // RC Right channel PWM input (Pin 2)
@@ -403,6 +406,11 @@ void sendHeartbeat() {
 
   // Send heartbeat directly to Jetson
   udpHeartbeat.beginPacket(JETSON_IP, JETSON_HEARTBEAT_PORT);
+  udpHeartbeat.print("HEARTBEAT\n");
+  udpHeartbeat.endPacket();
+
+  // Send heartbeat to monitor program
+  udpHeartbeat.beginPacket(JETSON_IP, MONITOR_HEARTBEAT_PORT);
   udpHeartbeat.print("HEARTBEAT\n");
   udpHeartbeat.endPacket();
 }
@@ -871,7 +879,8 @@ void setup() {
   Serial.println("\n=== System Ready ===");
   Serial.println("Control Priority: UDP > RC > Failsafe");
   Serial.println("Flow Meter: D7 polling mode, 1 Hz update rate");
-  Serial.println("UDP: Listen 8888, Send S/F to 192.168.50.164:28888, HEARTBEAT to 192.168.50.164:28887");
+  Serial.println("UDP: Listen 8888, Send S/F to 192.168.50.164:28888");
+  Serial.println("     HEARTBEAT to 192.168.50.164:28887 (Jetson), 28889 (Monitor)");
   Serial.println();
 }
 
