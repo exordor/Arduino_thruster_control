@@ -12,9 +12,9 @@
  *
  * Communication (UDP):
  *   - Arduino Listen: Port 8888 (C commands)
- *   - Arduino Send to: 192.168.50.164:28888 (S status, F flow)
- *   - Arduino Send to: 192.168.50.164:28887 (HEARTBEAT to Jetson)
- *   - Arduino Send to: 192.168.50.164:28889 (HEARTBEAT to Monitor)
+ *   - Arduino Send to: 192.168.50.200:28888 (S status, F flow)
+ *   - Arduino Send to: 192.168.50.200:28887 (HEARTBEAT to Jetson)
+ *   - Arduino Send to: 192.168.50.200:28889 (HEARTBEAT to Monitor)
  *   - Command format: C <left_us> <right_us>\n
  *   - Status format: S <mode> <left_us> <right_us>\n
  *   - Flow data format: F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n
@@ -116,6 +116,7 @@ const unsigned long FLOW_SEND_INTERVAL_MS = 200;      // Flow UDP send rate (5 H
 // === Timing Constants ===
 const unsigned long RC_FAILSAFE_MS = 200;            // RC signal timeout
 const unsigned long UDP_TIMEOUT_MS = 2000;           // UDP timeout (2s without data = offline)
+const unsigned long JETSON_ONLINE_TIMEOUT_MS = 2000; // Jetson online if any UDP seen recently
 const unsigned long HEARTBEAT_INTERVAL_MS = 1000;    // Heartbeat send interval (1 second, broadcast mode)
 const unsigned long WIFI_GRACE_MS = 400;             // Hold-last grace after timeout
 const int DECAY_STEP_US = 5;                         // Soft decay step toward 1500
@@ -188,7 +189,6 @@ unsigned long lastHeartbeatMs = 0;     // Last heartbeat sent
 int wifiOutL = ESC_MID;
 int wifiOutR = ESC_MID;
 bool haveWifiCmd = false;
-bool jetsonOnline = true;              // Always online (fixed address)
 
 // WiFi command buffer
 #define CMD_BUFFER_SIZE 64
@@ -222,6 +222,10 @@ float flowVelocity = 0.0f;
 double totalLiters = 0.0;
 
 // === Helper Functions ===
+
+inline bool isJetsonOnline(unsigned long now) {
+  return (lastUdpReceiveMs > 0) && (now - lastUdpReceiveMs < JETSON_ONLINE_TIMEOUT_MS);
+}
 
 // Right channel interrupt handler
 void onRightChange() {
@@ -402,6 +406,15 @@ void sendHeartbeat() {
   if (now - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) {
     return;
   }
+
+  // Only send if WiFi is connected (non-blocking check)
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  // Avoid blocking sends when Jetson is offline
+  if (!isJetsonOnline(now)) {
+    return;
+  }
   lastHeartbeatMs = now;
 
   // Send heartbeat directly to Jetson
@@ -498,16 +511,19 @@ void readUdpCommands() {
   }
 }
 
-// Check if Jetson is online via timeout detection
-void checkJetsonStatus() {
-  unsigned long now = millis();
-  jetsonOnline = (now - lastUdpReceiveMs) < UDP_TIMEOUT_MS;
-}
-
 // Send status via UDP to fixed Jetson address
 void sendUdpStatus() {
   unsigned long now = millis();
   if (now - lastStatusSendMs < STATUS_SEND_INTERVAL_MS) {
+    return;
+  }
+
+  // Only send if WiFi is connected (non-blocking check)
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  // Avoid blocking sends when Jetson is offline
+  if (!isJetsonOnline(now)) {
     return;
   }
 
@@ -530,6 +546,15 @@ void sendUdpFlowData() {
     return;
   }
 
+  // Only send if WiFi is connected (non-blocking check)
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  // Avoid blocking sends when Jetson is offline
+  if (!isJetsonOnline(now)) {
+    return;
+  }
+
   lastFlowSendMs = now;
 
   // Send flow data: "F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n"
@@ -545,8 +570,22 @@ void sendUdpFlowData() {
 void determineControlMode() {
   unsigned long now = millis();
 
-  // Check if Jetson is online and commands are active
-  bool udpActive = jetsonOnline && haveWifiCmd && (now - lastWifiCmdMs < UDP_TIMEOUT_MS);
+  bool jetsonOnline = isJetsonOnline(now);
+  if (!jetsonOnline) {
+    // Jetson offline: immediately favor RC and sync WiFi state to avoid jumps later
+    currentMode = 0;
+    currentLeftUs = rcOutL;
+    currentRightUs = rcOutR;
+    wifiAvgL = currentLeftUs;
+    wifiAvgR = currentRightUs;
+    wifiOutL = wifiAvgL;
+    wifiOutR = wifiAvgR;
+    haveWifiCmd = false;
+    return;
+  }
+
+  // Check if WiFi commands are active (recent command received)
+  bool udpActive = haveWifiCmd && (now - lastWifiCmdMs < UDP_TIMEOUT_MS);
 
   if (udpActive) {
     // UDP has priority, preserve smoothing state
@@ -879,8 +918,8 @@ void setup() {
   Serial.println("\n=== System Ready ===");
   Serial.println("Control Priority: UDP > RC > Failsafe");
   Serial.println("Flow Meter: D7 polling mode, 1 Hz update rate");
-  Serial.println("UDP: Listen 8888, Send S/F to 192.168.50.164:28888");
-  Serial.println("     HEARTBEAT to 192.168.50.164:28887 (Jetson), 28889 (Monitor)");
+  Serial.println("UDP: Listen 8888, Send S/F to 192.168.50.200:28888");
+  Serial.println("     HEARTBEAT to 192.168.50.200:28887 (Jetson), 28889 (Monitor)");
   Serial.println();
 }
 
@@ -907,44 +946,39 @@ void loop() {
   // 5. Poll again after UDP read (critical - UDP can block)
   pollFlowSensor();
 
-  // 6. Check Jetson online status (fast)
-  checkJetsonStatus();
-
-  // 7. Send heartbeat (may block!)
+  // 6. Send heartbeat (may block!)
   sendHeartbeat();
 
-  // 8. Poll again after heartbeat
+  // 7. Poll again after heartbeat
   pollFlowSensor();
 
-  // 9. Determine control mode and outputs (fast)
+  // 8. Determine control mode and outputs (fast)
   determineControlMode();
 
-  // 10. Update thrusters (fast)
+  // 9. Update thrusters (fast)
   updateThrusters();
 
-  // 11. Send status to Jetson (may block!)
+  // 10. Send status to Jetson (may block!)
   sendUdpStatus();
 
-  // 12. Poll again after status send
+  // 11. Poll again after status send
   pollFlowSensor();
 
-  // 13. Send flow data to Jetson (may block!)
+  // 12. Send flow data to Jetson (may block!)
   sendUdpFlowData();
 
-  // 14. Final poll before loop restart
+  // 13. Final poll before loop restart
   pollFlowSensor();
 
-  // 15. Calculate flow data (do this once per loop)
+  // 14. Calculate flow data (do this once per loop)
   calculateFlowData(now);
 
-  // 16. Connection state transitions (fast)
+  // 15. Connection state transitions (fast)
   bool wifiLink = (WiFi.status() == WL_CONNECTED);
   static bool prevWifiLink = false;
-  static bool prevJetsonOnline = false;
   static bool stateInit = false;
   if (!stateInit) {
     prevWifiLink = wifiLink;
-    prevJetsonOnline = jetsonOnline;
     stateInit = true;
   }
   if (wifiLink != prevWifiLink) {
@@ -952,9 +986,15 @@ void loop() {
     Serial.println(wifiLink ? "CONNECTED" : "DISCONNECTED");
     prevWifiLink = wifiLink;
   }
-  if (jetsonOnline != prevJetsonOnline) {
-    Serial.print("Jetson: ");
-    Serial.println(jetsonOnline ? "ONLINE" : "OFFLINE");
-    prevJetsonOnline = jetsonOnline;
+
+  // Debug: Print WiFi command age
+  static unsigned long lastDebugMs = 0;
+  if (now - lastDebugMs >= 1000) {  // Print every 1 second
+    unsigned long cmdAge = haveWifiCmd ? (now - lastWifiCmdMs) : 0;
+    Serial.print("WiFi cmd age: ");
+    Serial.print(cmdAge);
+    Serial.print(" ms | Mode: ");
+    Serial.println(currentMode == 1 ? "WiFi" : "RC");
+    lastDebugMs = now;
   }
 }
