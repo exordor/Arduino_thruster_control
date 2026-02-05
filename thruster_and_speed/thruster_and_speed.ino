@@ -91,13 +91,17 @@ bool reconnectInProgress = false;
 
 // UDP Configuration
 const unsigned int UDP_PORT = 8888;         // Data port (commands, status, flow)
-const unsigned int HEARTBEAT_PORT = 8887;   // Heartbeat broadcast port (HEARTBEAT messages)
-const unsigned int CONTROL_PING_PORT = 8889; // Control keepalive port (PING/PONG)
+const unsigned int HEARTBEAT_PORT = 8887;   // Heartbeat port
 WiFiUDP udp;              // Data UDP
-WiFiUDP udpHeartbeat;     // Heartbeat broadcast UDP
-WiFiUDP udpControlPing;   // Control ping/pong UDP
+WiFiUDP udpHeartbeat;     // Heartbeat UDP
 #define UDP_BUFFER_SIZE 128
 char udpBuffer[UDP_BUFFER_SIZE];
+
+// === Jetson Configuration (fixed IP and port) ===
+// Arduino sends heartbeat and data to this address
+const IPAddress JETSON_IP(192, 168, 50, 164);  // Jetson IP address
+const uint16_t JETSON_PORT = 28888;              // Jetson data port
+const uint16_t JETSON_HEARTBEAT_PORT = 28887;    // Jetson heartbeat port
 
 // === Pin Configuration ===
 const int CH_RIGHT_IN = 2;     // RC Right channel PWM input (Pin 2)
@@ -111,7 +115,8 @@ const float K_HZ_PER_LMIN = 5.0f;         // f = 5*Q (frequency per flow rate)
 const float PULSES_PER_L = 300.0f;        // 1L ≈ 300 pulses
 const float DIAMETER_M = 0.026f;          // 26 mm pipe diameter
 const float PIPE_AREA = 3.1415926f * (DIAMETER_M * 0.5f) * (DIAMETER_M * 0.5f);
-const unsigned long FLOW_UPDATE_INTERVAL_MS = 1000;  // 1 Hz update rate
+const unsigned long FLOW_CALC_INTERVAL_MS = 1000;    // Flow calculation window (1s for accurate pulse counting)
+const unsigned long FLOW_SEND_INTERVAL_MS = 200;      // Flow UDP send rate (5 Hz)
 
 // === Timing Constants ===
 const unsigned long RC_FAILSAFE_MS = 200;            // RC signal timeout
@@ -188,12 +193,7 @@ unsigned long lastHeartbeatMs = 0;     // Last heartbeat sent
 int wifiOutL = ESC_MID;
 int wifiOutR = ESC_MID;
 bool haveWifiCmd = false;
-bool jetsonOnline = false;             // Derived from timeout
-
-// Jetson's IP and Port (for sending data back)
-IPAddress jetsonIp;
-uint16_t jetsonPort = 0;
-bool jetsonAddrKnown = false;
+bool jetsonOnline = true;              // Always online (fixed address)
 
 // WiFi command buffer
 #define CMD_BUFFER_SIZE 64
@@ -217,7 +217,8 @@ int currentMode = 0;  // 0=RC, 1=WiFi
 unsigned long lastStatusSendMs = 0;
 
 // === Flow Meter State ===
-unsigned long lastFlowUpdateMs = 0;
+unsigned long lastFlowCalcMs = 0;     // Last time flow data was calculated
+unsigned long lastFlowSendMs = 0;     // Last time flow data was sent via UDP
 int lastFlowState = 0;
 unsigned long flowChangeCount = 0;
 float flowFreqHz = 0.0f;
@@ -342,20 +343,35 @@ void readRcInputs() {
 
 // === Flow Meter Functions ===
 
-// Update flow meter by polling D7 for state changes
-void updateFlowMeter() {
-  unsigned long now = millis();
-
-  // Fast polling for state changes
+// Lightweight pulse capture - call frequently throughout loop
+// This ensures we don't miss pulses even during time-consuming operations
+inline void pollFlowSensor() {
+  // Single read for maximum speed
   int s = digitalRead(FLOW_SENSOR_PIN);
   if (s != lastFlowState) {
     flowChangeCount++;
     lastFlowState = s;
   }
+}
 
-  // Calculate flow rate every second
-  if (now - lastFlowUpdateMs >= FLOW_UPDATE_INTERVAL_MS) {
-    unsigned long dtMs = now - lastFlowUpdateMs;
+// Update flow meter by polling D7 for state changes
+void updateFlowMeter() {
+  unsigned long now = millis();
+
+  // Multiple samples for better capture rate
+  for (int i = 0; i < 5; i++) {
+    pollFlowSensor();
+    delayMicroseconds(10);  // 10us delay between reads (total ~50us)
+  }
+
+  // Calculate flow rate at specified interval (1s window for accurate pulse counting)
+  calculateFlowData(now);
+}
+
+// Separate calculation function (called by updateFlowMeter)
+void calculateFlowData(unsigned long now) {
+  if (now - lastFlowCalcMs >= FLOW_CALC_INTERVAL_MS) {
+    unsigned long dtMs = now - lastFlowCalcMs;
     float dtS = dtMs / 1000.0f;
 
     unsigned long changes = flowChangeCount;
@@ -379,7 +395,9 @@ void updateFlowMeter() {
     double pulsesThisWindow = (double)changes / 2.0;
     totalLiters += pulsesThisWindow / PULSES_PER_L;
 
-    // Debug output to Serial
+    // Debug output to Serial (DISABLED for performance - causes ~15ms delay)
+    // Uncomment for debugging only
+    /*
     Serial.print("Flow: ");
     Serial.print(freqHz, 2);
     Serial.print(" Hz, ");
@@ -389,14 +407,15 @@ void updateFlowMeter() {
     Serial.print(" m/s, Total: ");
     Serial.print(totalLiters, 3);
     Serial.println(" L");
+    */
 
-    lastFlowUpdateMs = now;
+    lastFlowCalcMs = now;
   }
 }
 
 // === UDP Functions ===
 
-// Send heartbeat to broadcast (monitoring programs can listen passively)
+// Send heartbeat to Jetson (fixed address, unicast)
 void sendHeartbeat() {
   unsigned long now = millis();
   if (now - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) {
@@ -404,42 +423,13 @@ void sendHeartbeat() {
   }
   lastHeartbeatMs = now;
 
-  // Broadcast heartbeat to all network (no need to know client address)
-  udpHeartbeat.beginPacket((uint32_t)0xFFFFFFFF, HEARTBEAT_PORT);  // 255.255.255.255
+  // Send heartbeat directly to Jetson
+  udpHeartbeat.beginPacket(JETSON_IP, JETSON_HEARTBEAT_PORT);
   udpHeartbeat.print("HEARTBEAT\n");
   udpHeartbeat.endPacket();
 }
 
-// Read control ping on port 8889 (separate from data port)
-void readControlPing() {
-  int packetSize = udpControlPing.parsePacket();
-  if (packetSize == 0) {
-    return;
-  }
-
-  // Any data on control ping port counts as activity for online status
-  lastUdpReceiveMs = millis();
-
-  // Learn client address from PING - this is where we'll send status/flow data
-  // This allows Arduino to automatically send data without requiring a C command first
-  jetsonIp = udpControlPing.remoteIP();
-  jetsonPort = udpControlPing.remotePort();
-  jetsonAddrKnown = true;
-
-  char buffer[32];
-  int len = udpControlPing.read(buffer, sizeof(buffer) - 1);
-  if (len > 0) {
-    buffer[len] = '\0';
-    if (strcmp(buffer, "PING") == 0) {
-      Serial.println("Control PING received, sending PONG");
-      udpControlPing.beginPacket(udpControlPing.remoteIP(), udpControlPing.remotePort());
-      udpControlPing.print("PONG\n");
-      udpControlPing.endPacket();
-    }
-  }
-}
-
-// Read UDP commands from Jetson (data port 8888 - C/S/F only, no PING)
+// Read UDP commands from Jetson (data port 8888)
 void readUdpCommands() {
   int packetSize = udp.parsePacket();
 
@@ -449,11 +439,6 @@ void readUdpCommands() {
 
   // Data received - update timestamp
   lastUdpReceiveMs = millis();
-
-  // Save sender's address for responses
-  jetsonIp = udp.remoteIP();
-  jetsonPort = udp.remotePort();
-  jetsonAddrKnown = true;
 
   // Read data
   int len = udp.read(udpBuffer, sizeof(udpBuffer) - 1);
@@ -533,12 +518,8 @@ void checkJetsonStatus() {
   jetsonOnline = (now - lastUdpReceiveMs) < UDP_TIMEOUT_MS;
 }
 
-// Send status via UDP
+// Send status via UDP to fixed Jetson address
 void sendUdpStatus() {
-  if (!jetsonAddrKnown || !jetsonOnline) {
-    return;
-  }
-
   unsigned long now = millis();
   if (now - lastStatusSendMs < STATUS_SEND_INTERVAL_MS) {
     return;
@@ -551,28 +532,26 @@ void sendUdpStatus() {
   snprintf(statusBuf, sizeof(statusBuf), "S %d %d %d\n",
            currentMode, currentLeftUs, currentRightUs);
 
-  udp.beginPacket(jetsonIp, jetsonPort);
+  udp.beginPacket(JETSON_IP, JETSON_PORT);
   udp.print(statusBuf);
   udp.endPacket();
 }
 
-// Send flow data via UDP
+// Send flow data via UDP to fixed Jetson address
 void sendUdpFlowData() {
-  if (!jetsonAddrKnown || !jetsonOnline) {
+  unsigned long now = millis();
+  if (now - lastFlowSendMs < FLOW_SEND_INTERVAL_MS) {
     return;
   }
 
-  unsigned long now = millis();
-  if (now - lastFlowUpdateMs < FLOW_UPDATE_INTERVAL_MS) {
-    return;
-  }
+  lastFlowSendMs = now;
 
   // Send flow data: "F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n"
   char flowBuf[64];
   snprintf(flowBuf, sizeof(flowBuf), "F %.2f %.2f %.4f %.3f\n",
            flowFreqHz, flowLmin, flowVelocity, totalLiters);
 
-  udp.beginPacket(jetsonIp, jetsonPort);
+  udp.beginPacket(JETSON_IP, JETSON_PORT);
   udp.print(flowBuf);
   udp.endPacket();
 }
@@ -663,14 +642,11 @@ bool reconnectWiFi() {
       // Restart UDP servers
       udp.begin(UDP_PORT);
       udpHeartbeat.begin(HEARTBEAT_PORT);
-      udpControlPing.begin(CONTROL_PING_PORT);
       Serial.print("UDP servers restarted on ports ");
       Serial.print(UDP_PORT);
       Serial.print(" (data), ");
-      Serial.print(HEARTBEAT_PORT);
-      Serial.print(" (heartbeat), ");
-      Serial.println(CONTROL_PING_PORT);
-      Serial.println(" (control ping)");
+      Serial.println(HEARTBEAT_PORT);
+      Serial.println(" (heartbeat)");
 
       return true;
     }
@@ -742,14 +718,11 @@ bool reconnectWiFi() {
       // Start UDP servers
       udp.begin(UDP_PORT);
       udpHeartbeat.begin(HEARTBEAT_PORT);
-      udpControlPing.begin(CONTROL_PING_PORT);
       Serial.print("UDP servers started on ports ");
       Serial.print(UDP_PORT);
       Serial.print(" (data), ");
-      Serial.print(HEARTBEAT_PORT);
-      Serial.print(" (heartbeat), ");
-      Serial.println(CONTROL_PING_PORT);
-      Serial.println(" (control ping)");
+      Serial.println(HEARTBEAT_PORT);
+      Serial.println(" (heartbeat)");
 
       return true;
     }
@@ -898,15 +871,10 @@ void setup() {
     Serial.print("Data UDP server started on port ");
     Serial.println(UDP_PORT);
 
-    // Start heartbeat broadcast UDP server
+    // Start heartbeat UDP server
     udpHeartbeat.begin(HEARTBEAT_PORT);
-    Serial.print("Heartbeat broadcast server started on port ");
+    Serial.print("Heartbeat server started on port ");
     Serial.println(HEARTBEAT_PORT);
-
-    // Start control ping UDP server
-    udpControlPing.begin(CONTROL_PING_PORT);
-    Serial.print("Control ping server started on port ");
-    Serial.println(CONTROL_PING_PORT);
     Serial.println("Ready for UDP control commands");
   } else {
     Serial.println("WiFi unavailable - Running in RC only mode");
@@ -934,40 +902,55 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 0. Check WiFi status and auto-reconnect if needed
+  // 0. Poll flow sensor (lightweight, high frequency)
+  pollFlowSensor();
+
+  // 1. Check WiFi status and auto-reconnect if needed
   checkWiFiStatus();
 
-  // 1. Read RC inputs (non-blocking with interrupts)
+  // 2. Poll again after WiFi check (may have missed pulses)
+  pollFlowSensor();
+
+  // 3. Read RC inputs (non-blocking with interrupts)
   readRcInputs();
 
-  // 2. Read UDP commands (non-blocking)
+  // 4. Read UDP commands (may block!)
   readUdpCommands();
 
-  // 2.5. Read control ping (separate port for keepalive)
-  readControlPing();
+  // 5. Poll again after UDP read (critical - UDP can block)
+  pollFlowSensor();
 
-  // 3. Check Jetson online status (timeout detection)
+  // 6. Check Jetson online status (fast)
   checkJetsonStatus();
 
-  // 4. Update flow meter (polling)
-  updateFlowMeter();
-
-  // 5. Send heartbeat (500ms)
+  // 7. Send heartbeat (may block!)
   sendHeartbeat();
 
-  // 6. Determine control mode and outputs
+  // 8. Poll again after heartbeat
+  pollFlowSensor();
+
+  // 9. Determine control mode and outputs (fast)
   determineControlMode();
 
-  // 7. Update thrusters
+  // 10. Update thrusters (fast)
   updateThrusters();
 
-  // 8. Send status to Jetson (10 Hz)
+  // 11. Send status to Jetson (may block!)
   sendUdpStatus();
 
-  // 9. Send flow data to Jetson (1 Hz)
+  // 12. Poll again after status send
+  pollFlowSensor();
+
+  // 13. Send flow data to Jetson (may block!)
   sendUdpFlowData();
 
-  // 10. Connection state transitions
+  // 14. Final poll before loop restart
+  pollFlowSensor();
+
+  // 15. Calculate flow data (do this once per loop)
+  calculateFlowData(now);
+
+  // 16. Connection state transitions (fast)
   bool wifiLink = (WiFi.status() == WL_CONNECTED);
   static bool prevWifiLink = false;
   static bool prevJetsonOnline = false;
@@ -988,7 +971,9 @@ void loop() {
     prevJetsonOnline = jetsonOnline;
   }
 
-  // 11. Print debug status every 5 seconds
+  // 11. Print debug status every 5 seconds (DISABLED for performance)
+  // Uncomment for debugging only
+  /*
   static unsigned long lastDebugMs = 0;
   if (now - lastDebugMs > 5000) {
     lastDebugMs = now;
@@ -1004,13 +989,11 @@ void loop() {
     }
     Serial.print(" | Jetson: ");
     Serial.print(jetsonOnline ? "ONLINE" : "OFFLINE");
-    if (jetsonAddrKnown) {
-      Serial.print(" (");
-      Serial.print(jetsonIp);
-      Serial.print(":");
-      Serial.print(jetsonPort);
-      Serial.print(")");
-    }
+    Serial.print(" (");
+    Serial.print(JETSON_IP);
+    Serial.print(":");
+    Serial.print(JETSON_PORT);
+    Serial.print(")");
     Serial.print(" | L=");
     Serial.print(currentLeftUs);
     Serial.print(" R=");
@@ -1021,6 +1004,5 @@ void loop() {
     Serial.print(totalLiters, 3);
     Serial.println(" L");
   }
-
-  delay(5);
+  */
 }
