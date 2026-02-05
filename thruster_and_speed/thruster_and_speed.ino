@@ -93,7 +93,7 @@ char udpBuffer[UDP_BUFFER_SIZE];
 
 // === Jetson Configuration (fixed IP and port) ===
 // Arduino sends heartbeat and data to this address
-const IPAddress JETSON_IP(192, 168, 50, 164);  // Jetson IP address
+const IPAddress JETSON_IP(192, 168, 50, 200);  // Jetson IP address
 const uint16_t JETSON_PORT = 28888;              // Jetson data port
 const uint16_t JETSON_HEARTBEAT_PORT = 28887;    // Jetson heartbeat port
 const uint16_t MONITOR_HEARTBEAT_PORT = 28889;   // Monitor heartbeat port
