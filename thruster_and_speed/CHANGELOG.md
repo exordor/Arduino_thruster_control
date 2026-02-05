@@ -5,6 +5,18 @@ All notable changes to the thruster and speed control project will be documented
 ## [Unreleased]
 
 ### Added
+- **Heartbeat Broadcast on 8889** — Arduino now broadcasts `HEARTBEAT` on port 8889 for passive discovery.
+- **Jetson PING on 8889** — Jetson sends `PING` on port 8889 to mark itself online.
+
+### Changed
+- **Data Port Simplified** — Port 8888 now handles data only (`C` commands, `S` status, `F` flow).
+- **Online Gating** — Arduino starts unicast heartbeat/data only after a recent PING/command.
+- **Heartbeat Interval** — Standardized to 1s (1000ms).
+
+### Removed
+- **Monitor Unicast Heartbeat** — Disabled by default (port 28889).
+
+### Added
 - **Hold Test Mode** - New test mode in `udp_test.py` for testing continuous rotation
   - Holds a single command for specified duration (default 20s)
   - Sends commands repeatedly at 10Hz (every 100ms) to maintain target

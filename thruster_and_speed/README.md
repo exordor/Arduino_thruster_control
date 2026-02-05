@@ -7,8 +7,8 @@ A dual thruster control system with integrated flow meter sensor for Arduino UNO
 - **Dual Thruster Control**: Two ESC outputs for differential thrust
 - **RC Fallback**: Automatic switch to RC receiver when UDP timeout
 - **Flow Meter**: Real-time flow rate and volume measurement
-- **Dual-Port UDP**: Separated data and heartbeat channels for reliable communication
-- **PING/PONG Protocol**: Handshake and keep-alive without affecting thruster commands
+- **Dual-Port UDP**: Data (8888) and heartbeat (8889) separated for reliability
+- **PING Heartbeat (8889)**: Jetson keeps Arduino "online" without touching data port
 - **Multi-Network WiFi**: Auto-connect to configured networks with reconnection
 
 ## Hardware
@@ -30,7 +30,7 @@ A dual thruster control system with integrated flow meter sensor for Arduino UNO
 | Pulses per liter | 300 |
 | Flow update rate | 1 Hz |
 | Status update rate | 10 Hz |
-| Heartbeat interval | 500 ms |
+| Heartbeat interval | 1000 ms |
 | UDP timeout | 2000 ms |
 | **WiFi command rate limit** | **20 ms min interval (50 Hz max)** |
 | **RC deadband** | **±40 µs (joystick drift resistance)** |
@@ -55,8 +55,8 @@ The system uses two separate UDP ports for cleaner protocol separation:
 
 | Port | Direction | Purpose |
 |------|-----------|---------|
-| **8888** | Bidirectional | Data (commands, status, flow, PING/PONG) |
-| **8889** | Arduino → Client | Heartbeat (HEARTBEAT messages only) |
+| **8888** | Bidirectional | Data (commands, status, flow) |
+| **8889** | Bidirectional | Heartbeat (Jetson PING → Arduino, Arduino HEARTBEAT → clients) |
 
 ### Connection
 
@@ -64,6 +64,8 @@ The system uses two separate UDP ports for cleaner protocol separation:
 - **Data Port**: 8888
 - **Heartbeat Port**: 8889
 - **Arduino IP**: 192.168.50.100 (configurable)
+- **Heartbeat Broadcast**: 192.168.50.255:8889 (always when WiFi connected)
+- **Jetson Unicast Heartbeat**: 192.168.50.200:28887 (only after PING)
 
 ### Message Protocol
 
@@ -72,16 +74,15 @@ The system uses two separate UDP ports for cleaner protocol separation:
 | Direction | Format | Purpose | Rate Limit |
 |-----------|--------|---------|-------------|
 | Client → Arduino | `C <left_us> <right_us>\n` | Thruster command | **20ms min** |
-| Client → Arduino | `PING\n` | Handshake/keep-alive | No limit |
 | Arduino → Client | `S <mode> <left_us> <right_us>\n` | Thruster status | 10 Hz |
-| Arduino → Client | `F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n` | Flow data | 1 Hz |
-| Arduino → Client | `PONG\n` | Response to PING | On PING |
+| Arduino → Client | `F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n` | Flow data | 5 Hz |
 
 #### Heartbeat Port (8889)
 
 | Direction | Format | Purpose | Rate |
 |-----------|--------|---------|------|
-| Arduino → Client | `HEARTBEAT\n` | Keep-alive | 500ms |
+| Jetson → Arduino | `PING\n` | Online/keep-alive | 1 Hz |
+| Arduino → Client | `HEARTBEAT\n` | Keep-alive (broadcast + optional unicast) | 1 Hz |
 
 ### Protocol Examples
 
@@ -89,9 +90,8 @@ The system uses two separate UDP ports for cleaner protocol separation:
 # Command (Client → Arduino, port 8888)
 C 1600 1600\n
 
-# PING/PONG handshake (port 8888)
-Client:  PING\n
-Arduino: PONG\n
+# Heartbeat ping (Jetson → Arduino, port 8889)
+PING\n
 
 # Status response (Arduino → Client, port 8888)
 S 1 1600 1600\n
@@ -99,7 +99,7 @@ S 1 1600 1600\n
 # Flow data (Arduino → Client, port 8888)
 F 25.50 5.10 0.1601 12.345\n
 
-# Heartbeat (Arduino → Client, port 8889)
+# Heartbeat (Arduino → Broadcast/Client, port 8889)
 HEARTBEAT\n
 ```
 
@@ -123,17 +123,16 @@ HEARTBEAT\n
 
 ```
 Client startup:
-1. Bind to local port for data (ephemeral)
-2. Bind to local port 8889 for heartbeat
-3. Send PING to Arduino:8888
-4. Receive PONG from Arduino:8888 (handshake complete)
-5. Receive HEARTBEAT from Arduino:8889 (every 500ms)
-6. Receive STATUS/FLOW from Arduino:8888
+1. Bind to local port for data (ephemeral) → Arduino:8888
+2. Bind to local port 8889 for heartbeat (rx + tx)
+3. Receive Arduino HEARTBEAT on 8889 (broadcast, every 1s)
+4. Send PING to Arduino:8889 (keep-alive)
+5. Arduino starts unicast HEARTBEAT (28887) + STATUS/FLOW (28888) after PING
 
 Continuous operation:
-- Send PING every 1s (keep-alive)
-- Receive HEARTBEAT every 500ms
-- If 2s without any data → Arduino switches to RC mode
+- Send PING every 1s (keep-alive on 8889)
+- Receive broadcast HEARTBEAT on 8889
+- If 2s without PING at Arduino → Arduino switches to RC and stops unicast data
 ```
 
 ### Why Separate Ports?
@@ -151,8 +150,8 @@ The system uses different filtering parameters for optimal performance with each
 
 | Characteristic | RC (Joystick) | WiFi (UDP) |
 |----------------|---------------|-----------|
-| Filter Alpha | 25% (smooth) | 80% (fast) |
-| Max Step | 15µs/cycle | 50µs/cycle |
+| Filter Alpha | 25% (smooth) | 100% (direct) |
+| Max Step | 15µs/cycle | 500µs/cycle |
 | Deadband | ±40µs | N/A |
 | Purpose | Resist drift | Low latency |
 
@@ -229,9 +228,9 @@ ESCs initialized to neutral (1500 µs)
 === System Ready ===
 Control Priority: UDP > RC > Failsafe
 RC Filter: 25% alpha, ±40µs deadband (smooth, drift-resistant)
-WiFi Filter: 80% alpha, 20ms min interval (low latency)
+WiFi Filter: 100% alpha, 20ms min interval (direct)
 Flow Meter: D7 polling mode, 1 Hz update rate
-Heartbeat: 500ms (port 8889), Timeout: 2000ms
+Heartbeat: 1000ms (port 8889), Timeout: 2000ms
 ```
 
 ## Python Client Example
@@ -254,10 +253,10 @@ heartbeat_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 heartbeat_sock.bind(('', HEARTBEAT_PORT))
 
 print(f"Data socket: {data_sock.getsockname()[1]} -> {ARDUINO_IP}:{DATA_PORT}")
-print(f"Heartbeat socket: {HEARTBEAT_PORT} <- {ARDUINO_IP}:{HEARTBEAT_PORT}")
+print(f"Heartbeat socket: {HEARTBEAT_PORT} <- broadcast/{ARDUINO_IP}:{HEARTBEAT_PORT}")
 
-# Send handshake PING
-data_sock.sendto(b"PING\n", (ARDUINO_IP, DATA_PORT))
+# Send keep-alive PING to heartbeat port
+heartbeat_sock.sendto(b"PING\n", (ARDUINO_IP, HEARTBEAT_PORT))
 
 # Listen for responses
 while True:
@@ -270,8 +269,6 @@ while True:
 
         if sock == heartbeat_sock:
             print(f"[HEARTBEAT] {msg}")
-        elif msg == "PONG":
-            print(f"[PONG] {msg}")
         elif msg.startswith('S '):
             print(f"[STATUS] {msg}")
         elif msg.startswith('F '):
@@ -284,22 +281,22 @@ A comprehensive test script is included:
 
 ```bash
 # Monitor mode (listen only)
-python3 udp_test.py --mode monitor
+python3 udp_test.py --mode monitor --heartbeat-port 8889
 
 # Monitor with keep-alive (send PING every second)
-python3 udp_test.py --mode monitor --keep-alive
+python3 udp_test.py --mode monitor --keep-alive --heartbeat-port 8889
 
 # Interactive mode (send commands)
-python3 udp_test.py --mode interactive
+python3 udp_test.py --mode interactive --heartbeat-port 8889
 
 # 10Hz latency test (measure control delay)
-python3 udp_test.py --mode hz10 --duration 10
+python3 udp_test.py --mode hz10 --duration 10 --heartbeat-port 8889
 
 # Thruster control test
-python3 udp_test.py --mode thruster
+python3 udp_test.py --mode thruster --heartbeat-port 8889
 
 # Heartbeat test (test for 30 seconds)
-python3 udp_test.py --mode heartbeat --duration 30
+python3 udp_test.py --mode heartbeat --duration 30 --heartbeat-port 8889
 
 # Custom ports
 python3 udp_test.py --data-port 8888 --heartbeat-port 8889
@@ -327,8 +324,8 @@ python3 udp_test.py --ip 192.168.50.100
 ### Key Implementation Points
 
 1. **Dual Socket Setup**: Create two UDP sockets, one for data (port 8888) and one for heartbeat (port 8889)
-2. **Initial Handshake**: Send `PING` immediately after connection
-3. **Keep-Alive**: Send `PING` every 1 second to maintain connection
+2. **Initial Handshake**: Send `PING` immediately after connection on port 8889
+3. **Keep-Alive**: Send `PING` every 1 second on port 8889 to maintain connection
 4. **Use `select()`**: Monitor both sockets simultaneously for incoming data
 5. **Handle Rate Limiting**: WiFi commands have 20ms minimum interval, PING does not
 
@@ -346,7 +343,7 @@ void udpReceiveThread() {
 // Thread 2: Keep-alive
 void keepAliveThread() {
     while (running) {
-        send_ping(data_sock);
+        send_ping(heartbeat_sock);
         sleep(1);
     }
 }
@@ -374,8 +371,8 @@ The following constants can be adjusted to change control behavior:
 
 ```cpp
 // WiFi (Low Latency)
-const int WIFI_FILTER_ALPHA = 80;     // Higher = faster response (20-100%)
-const int WIFI_MAX_STEP_US = 50;      // Higher = faster ramp (10-100µs)
+const int WIFI_FILTER_ALPHA = 100;    // 100% = no filtering, direct control
+const int WIFI_MAX_STEP_US = 500;     // Higher = faster ramp (10-500µs)
 const unsigned long MIN_CMD_INTERVAL_MS = 20;  // Min time between commands
 
 // RC (Smooth, Drift-Resistant)
@@ -396,12 +393,12 @@ const int DEADBAND_US = 40;            // Deadband around center (20-100µs)
 
 - Check client is sending data to port 8888
 - Verify heartbeat is being received on port 8889
-- Send a PING command to trigger response
+- Send PING to port 8889 to mark Jetson online
 - Verify IP address configuration matches
 
-### No PONG response to PING
+### No status/flow after PING
 
-- Ensure Arduino code is uploaded with PING handler
+- Ensure Jetson is sending PING to port 8889
 - Check data port (8888) is correct
 - Verify firewall is not blocking UDP
 
@@ -409,7 +406,7 @@ const int DEADBAND_US = 40;            // Deadband around center (20-100µs)
 
 - Verify heartbeat port (8889) is correct
 - Check client is bound to port 8889
-- Ensure Arduino has received at least one packet (to learn client address)
+- Confirm broadcast traffic is allowed on the WiFi network
 
 ### Command rate limiting
 
