@@ -4,24 +4,21 @@ UDP Thruster Control Test Script
 
 Tests the heartbeat mechanism and data reception from the Arduino thruster controller.
 
-Arduino Protocol (Three-Port Architecture):
+Arduino Protocol (Two-Port Architecture):
 - Data Port: 8888 (commands C, status S, flow F)
-- Control Ping Port: 8889 (PING/PONG keepalive)
-- Heartbeat Broadcast Port: 8887 (HEARTBEAT messages)
+- Heartbeat Port: 8889 (Jetson PING keepalive + Arduino HEARTBEAT broadcast)
 
 Data Port (8888):
 - Command: "C <left_us> <right_us>\n" to send thruster commands
 - Status: "S <mode> <left_us> <right_us>\n" every 100ms
-- Flow: "F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n" every 1s
+- Flow: "F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n" every 200ms
 
-Control Ping Port (8889):
-- Ping: "PING" -> "PONG" (handshake/keep-alive, no rate limit)
-
-Heartbeat Broadcast Port (8887):
+Heartbeat Port (8889):
+- Ping: "PING" (Jetson -> Arduino, keep-alive)
 - Heartbeat: "HEARTBEAT\n" every 1s (broadcast from Arduino to all network)
 
 Mode: 0=RC, 1=WiFi
-Timeout: 2s without data = Arduino switches to RC mode
+Timeout: 2s without PING/command = Arduino switches to RC mode
 """
 
 import socket
@@ -57,16 +54,14 @@ class FlowData:
 
 
 class UDPTestClient:
-    """UDP client for testing Arduino thruster communication with three ports"""
+    """UDP client for testing Arduino thruster communication with data + heartbeat ports"""
 
     def __init__(self, arduino_ip: str = "192.168.50.100", data_port: int = 8888,
-                 control_ping_port: int = 8889, heartbeat_port: int = 8887):
+                 heartbeat_port: int = 8889):
         self.arduino_ip = arduino_ip
         self.data_port = data_port
-        self.control_ping_port = control_ping_port
         self.heartbeat_port = heartbeat_port
         self.data_sock: Optional[socket.socket] = None
-        self.ping_sock: Optional[socket.socket] = None
         self.heartbeat_sock: Optional[socket.socket] = None
         self.running = False
         self.receive_thread: Optional[threading.Thread] = None
@@ -84,11 +79,11 @@ class UDPTestClient:
         self.latest_status = StatusData()
         self.latest_flow = FlowData()
 
-        # Heartbeat timeout detection (Arduino sends every 500ms)
-        self.heartbeat_timeout = 1.0  # Consider offline if no heartbeat for 1s
+        # Heartbeat timeout detection (Arduino sends every 1s)
+        self.heartbeat_timeout = 2.0  # Consider offline if no heartbeat for 2s
 
     def connect(self) -> bool:
-        """Create and bind three UDP sockets (data, control ping, heartbeat)"""
+        """Create and bind two UDP sockets (data, heartbeat)"""
         try:
             # Data socket (commands, status, flow)
             self.data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -96,27 +91,20 @@ class UDPTestClient:
             self.data_sock.settimeout(0.1)  # Non-blocking with timeout
             data_local_port = self.data_sock.getsockname()[1]
 
-            # Control ping socket (PING/PONG keepalive)
-            self.ping_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.ping_sock.bind(('', 0))
-            self.ping_sock.settimeout(0.1)  # Non-blocking with timeout
-            ping_local_port = self.ping_sock.getsockname()[1]
-
-            # Heartbeat socket (HEARTBEAT broadcast messages only)
+            # Heartbeat socket (PING keepalive + HEARTBEAT broadcast)
             self.heartbeat_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.heartbeat_sock.bind(('', self.heartbeat_port))
             self.heartbeat_sock.settimeout(0.1)  # Non-blocking with timeout
 
             print(f"[INFO] Data socket: local port {data_local_port} <-> {self.arduino_ip}:{self.data_port}")
-            print(f"[INFO] Control ping socket: local port {ping_local_port} <-> {self.arduino_ip}:{self.control_ping_port}")
-            print(f"[INFO] Heartbeat socket: local port {self.heartbeat_port} <- {self.arduino_ip}:{self.heartbeat_port} (broadcast)")
+            print(f"[INFO] Heartbeat socket: local port {self.heartbeat_port} <- broadcast/{self.arduino_ip}:{self.heartbeat_port}")
             return True
         except socket.error as e:
             print(f"[ERROR] Failed to create sockets: {e}")
             return False
 
     def disconnect(self):
-        """Stop receiving and close all three sockets"""
+        """Stop receiving and close both sockets"""
         self.running = False
         if self.receive_thread:
             self.receive_thread.join(timeout=1.0)
@@ -125,9 +113,6 @@ class UDPTestClient:
         if self.data_sock:
             self.data_sock.close()
             self.data_sock = None
-        if self.ping_sock:
-            self.ping_sock.close()
-            self.ping_sock = None
         if self.heartbeat_sock:
             self.heartbeat_sock.close()
             self.heartbeat_sock = None
@@ -157,8 +142,8 @@ class UDPTestClient:
     def send_handshake(self) -> bool:
         """Send a PING handshake command to trigger Arduino response
 
-        Arduino requires receiving at least one UDP packet before it will
-        start sending heartbeats back (to learn the client's address).
+        Arduino requires receiving a PING on port 8889 before it will
+        start unicast heartbeats/data back to the Jetson address.
 
         Returns:
             True if handshake was sent successfully
@@ -166,17 +151,17 @@ class UDPTestClient:
         return self.send_ping()
 
     def send_ping(self) -> bool:
-        """Send PING for handshake/keep-alive (on control ping port)
+        """Send PING for handshake/keep-alive (on heartbeat port)
 
         Returns:
             True if PING was sent successfully
         """
-        if not self.ping_sock:
-            print("[ERROR] Ping socket not connected")
+        if not self.heartbeat_sock:
+            print("[ERROR] Heartbeat socket not connected")
             return False
 
         try:
-            self.ping_sock.sendto(b"PING\n", (self.arduino_ip, self.control_ping_port))
+            self.heartbeat_sock.sendto(b"PING\n", (self.arduino_ip, self.heartbeat_port))
             return True
         except socket.error as e:
             print(f"[ERROR] Failed to send PING: {e}")
@@ -214,13 +199,13 @@ class UDPTestClient:
         return None
 
     def _receive_loop(self):
-        """Background thread for receiving UDP messages from all three ports"""
+        """Background thread for receiving UDP messages from data and heartbeat ports"""
         import select
 
         while self.running:
             try:
                 # Use select to wait for data on any socket
-                sockets = [s for s in (self.data_sock, self.ping_sock, self.heartbeat_sock) if s]
+                sockets = [s for s in (self.data_sock, self.heartbeat_sock) if s]
                 readable, _, _ = select.select(sockets, [], [], 0.1)
 
                 for sock in readable:
@@ -229,8 +214,6 @@ class UDPTestClient:
                     message = data.decode('utf-8', errors='ignore').strip()
 
                     # Determine which socket received the data
-                    is_data = (sock == self.data_sock)
-                    is_ping = (sock == self.ping_sock)
                     is_heartbeat = (sock == self.heartbeat_sock)
 
                     # Handle different message types
@@ -239,9 +222,6 @@ class UDPTestClient:
                         self.last_heartbeat_time = time.time()
                         port_str = f":{addr[1]}" if is_heartbeat else ""
                         print(f"[HEARTBEAT] #{self.heartbeat_count} from {addr[0]}{port_str}")
-
-                    elif message == "PONG":
-                        print(f"[PONG] Response from {addr[0]}:{addr[1]}")
 
                     elif message.startswith('S '):
                         status = self._parse_status(message)
@@ -271,14 +251,14 @@ class UDPTestClient:
 
     def start_receiving(self):
         """Start background receive thread"""
-        if not self.data_sock or not self.ping_sock or not self.heartbeat_sock:
+        if not self.data_sock or not self.heartbeat_sock:
             print("[ERROR] Sockets not connected")
             return
 
         self.running = True
         self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
         self.receive_thread.start()
-        print("[INFO] Receive thread started (listening on all three ports)")
+        print("[INFO] Receive thread started (listening on data + heartbeat ports)")
 
     def _keep_alive_loop(self, interval: float = 1.0):
         """Background thread for sending keep-alive PING messages
@@ -298,8 +278,8 @@ class UDPTestClient:
             interval: Seconds between keep-alive pings (default: 1.0)
                       Arduino timeout is 2s, so 1s is safe
         """
-        if not self.ping_sock:
-            print("[ERROR] Ping socket not connected")
+        if not self.heartbeat_sock:
+            print("[ERROR] Heartbeat socket not connected")
             return
 
         self.keep_alive_thread = threading.Thread(
@@ -866,16 +846,10 @@ def main():
         help='Data UDP port for commands, status, flow (default: 8888)'
     )
     parser.add_argument(
-        '--control-ping-port',
-        type=int,
-        default=8889,
-        help='Control ping UDP port for PING/PONG keepalive (default: 8889)'
-    )
-    parser.add_argument(
         '--heartbeat-port',
         type=int,
-        default=8887,
-        help='Heartbeat broadcast UDP port (default: 8887)'
+        default=8889,
+        help='Heartbeat UDP port for PING/HEARTBEAT (default: 8889)'
     )
     parser.add_argument(
         '--mode',
@@ -911,7 +885,7 @@ def main():
     parser.add_argument(
         '--no-handshake',
         action='store_true',
-        help='Disable automatic handshake (Arduino will not respond until it receives a packet)'
+        help='Disable automatic handshake (you must send PING to 8889 manually)'
     )
     parser.add_argument(
         '--keep-alive',
@@ -922,7 +896,7 @@ def main():
     args = parser.parse_args()
 
     # Create client
-    client = UDPTestClient(args.ip, args.data_port, args.control_ping_port, args.heartbeat_port)
+    client = UDPTestClient(args.ip, args.data_port, args.heartbeat_port)
 
     # Connect
     if not client.connect():
@@ -932,9 +906,9 @@ def main():
     # Start receiving
     client.start_receiving()
 
-    # Auto-handshake: Arduino needs to receive a packet first to learn client address
+    # Auto-handshake: Arduino starts unicast output after PING on heartbeat port
     if not args.no_handshake:
-        print("\n[HANDSHAKE] Sending PING to trigger Arduino response...")
+        print("\n[HANDSHAKE] Sending PING to mark Jetson online...")
         if args.initial_command:
             left, right = args.initial_command
             client.send_command(left, right)
@@ -943,7 +917,7 @@ def main():
         print("[HANDSHAKE] Sent PING")
     else:
         print("\n[INFO] Auto-handshake disabled")
-        print(f"       Send a UDP packet to {args.ip}:{args.data_port} to trigger Arduino response")
+        print(f"       Send PING to {args.ip}:{args.heartbeat_port} to mark Jetson online")
 
     # Send initial command if specified (and not in handshake mode)
     if args.initial_command and not args.no_handshake:

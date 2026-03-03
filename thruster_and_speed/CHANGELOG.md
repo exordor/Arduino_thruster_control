@@ -12,6 +12,7 @@ All notable changes to the thruster and speed control project will be documented
 - **Data Port Simplified** — Port 8888 now handles data only (`C` commands, `S` status, `F` flow).
 - **Online Gating** — Arduino starts unicast heartbeat/data only after a recent PING/command.
 - **Heartbeat Interval** — Standardized to 1s (1000ms).
+- **udp_test.py** — Updated to two-port protocol (data 8888, heartbeat 8889).
 
 ### Removed
 - **Monitor Unicast Heartbeat** — Disabled by default (port 28889).
