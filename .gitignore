@@ -49,3 +49,5 @@ Desktop.ini
 *.pid
 *.seed
 *.pid.lock
+
+libraries/
