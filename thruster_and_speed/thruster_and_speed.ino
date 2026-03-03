@@ -1,9 +1,10 @@
 #include <WiFiS3.h>
 #include <Servo.h>
 #include <WiFiUdp.h>
+#include "DHT.h"
 
 /*
- * Dual Thrusters Control + Flow Meter - WiFi UDP + RC Hybrid Mode
+ * Dual Thrusters Control + Flow Meter + DHT22 - WiFi UDP + RC Hybrid Mode
  *
  * Control Priority:
  *   1. WiFi/UDP commands (if receiving data)
@@ -13,7 +14,7 @@
  * Communication (UDP):
  *   - Arduino Listen: Port 8888 (C commands)
  *   - Arduino Listen: Port 8889 (PING heartbeat from Jetson)
- *   - Arduino Send to: 192.168.50.200:28888 (S status, F flow)
+ *   - Arduino Send to: 192.168.50.200:28888 (S status, F flow, D dht)
  *   - Arduino Send to: 192.168.50.200:28887 (HEARTBEAT to Jetson, when online)
  *   - Arduino Send to: 192.168.50.200:28889 (HEARTBEAT to Monitor, when online) [optional]
  *   - Arduino Broadcast: 192.168.50.255:8889 (HEARTBEAT broadcast when WiFi connected)
@@ -21,12 +22,13 @@
  *   - Ping format: PING\n (Jetson heartbeat to Arduino on 8889)
  *   - Status format: S <mode> <left_us> <right_us>\n
  *   - Flow data format: F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n
+ *   - DHT data format: D <temp_c> <humidity>\n
  *   - Heartbeat: Arduino sends "HEARTBEAT\n" every 1s to both ports
  *   - Mode: 0=RC, 1=WiFi
  *
  * Jetson Programs:
  *   - Control node: Sends C commands on 8888, sends PING on 8889,
- *                   receives S/F on 28888, HEARTBEAT on 28887
+ *                   receives S/F/D on 28888, HEARTBEAT on 28887
  *   - Monitor node: Receives HEARTBEAT on 28889 (optional)
  *   - Connection detected by timeout: 2s without data = offline
  */
@@ -118,6 +120,12 @@ const float DIAMETER_M = 0.026f;          // 26 mm pipe diameter
 const float PIPE_AREA = 3.1415926f * (DIAMETER_M * 0.5f) * (DIAMETER_M * 0.5f);
 const unsigned long FLOW_CALC_INTERVAL_MS = 1000;    // Flow calculation window (1s for accurate pulse counting)
 const unsigned long FLOW_SEND_INTERVAL_MS = 200;      // Flow UDP send rate (5 Hz)
+
+// === DHT22 Configuration ===
+const byte DHT_PIN = 13;                              // D13 for DHT22 data
+#define DHT_TYPE DHT22
+const unsigned long DHT_READ_INTERVAL_MS = 2500;      // DHT22 max 0.5 Hz
+const unsigned long DHT_SEND_INTERVAL_MS = 1000;      // 1 Hz UDP send rate
 
 // === Timing Constants ===
 const unsigned long RC_FAILSAFE_MS = 200;            // RC signal timeout
@@ -227,6 +235,13 @@ float flowFreqHz = 0.0f;
 float flowLmin = 0.0f;
 float flowVelocity = 0.0f;
 double totalLiters = 0.0;
+
+// === DHT22 State ===
+DHT dht(DHT_PIN, DHT_TYPE);
+float dhtTemperature = 0.0f;     // Celsius
+float dhtHumidity = 0.0f;        // Percentage
+unsigned long lastDhtReadMs = 0;
+unsigned long lastDhtSendMs = 0;
 
 // === Helper Functions ===
 
@@ -402,6 +417,23 @@ void calculateFlowData(unsigned long now) {
     totalLiters += pulsesThisWindow / PULSES_PER_L;
 
     lastFlowCalcMs = now;
+  }
+}
+
+// === DHT22 Functions ===
+
+void readDhtSensor(unsigned long now) {
+  if (now - lastDhtReadMs < DHT_READ_INTERVAL_MS) {
+    return;
+  }
+  lastDhtReadMs = now;
+
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (!isnan(h) && !isnan(t)) {
+    dhtHumidity = h;
+    dhtTemperature = t;
   }
 }
 
@@ -611,6 +643,31 @@ void sendUdpFlowData() {
 
   udp.beginPacket(JETSON_IP, JETSON_PORT);
   udp.print(flowBuf);
+  udp.endPacket();
+}
+
+// Send DHT data via UDP to Jetson
+void sendUdpDhtData() {
+  unsigned long now = millis();
+  if (now - lastDhtSendMs < DHT_SEND_INTERVAL_MS) {
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  if (!isJetsonOnline(now)) {
+    return;
+  }
+
+  lastDhtSendMs = now;
+
+  // Send DHT data: "D <temp_c> <humidity>\n"
+  char dhtBuf[32];
+  snprintf(dhtBuf, sizeof(dhtBuf), "D %.2f %.2f\n", dhtTemperature, dhtHumidity);
+
+  udp.beginPacket(JETSON_IP, JETSON_PORT);
+  udp.print(dhtBuf);
   udp.endPacket();
 }
 
@@ -934,6 +991,10 @@ void setup() {
   lastFlowState = digitalRead(FLOW_SENSOR_PIN);
   Serial.println("Flow meter sensor configured on D7");
 
+  // Initialize DHT sensor
+  dht.begin();
+  Serial.println("DHT22 sensor configured on D13");
+
   // Connect to WiFi (try all networks in order)
   bool wifiConnected = connectToWiFi();
 
@@ -965,7 +1026,8 @@ void setup() {
   Serial.println("\n=== System Ready ===");
   Serial.println("Control Priority: UDP > RC > Failsafe");
   Serial.println("Flow Meter: D7 polling mode, 1 Hz update rate");
-  Serial.println("UDP: Listen 8888, Send S/F to 192.168.50.200:28888");
+  Serial.println("DHT22: D13, 1 Hz update rate");
+  Serial.println("UDP: Listen 8888, Send S/F/D to 192.168.50.200:28888");
   Serial.println("     HEARTBEAT broadcast to 192.168.50.255:8889");
   Serial.println("     HEARTBEAT unicast to 192.168.50.200:28887 (Jetson)");
   Serial.println();
@@ -1017,6 +1079,10 @@ void loop() {
 
   // 13. Send flow data to Jetson (may block!)
   sendUdpFlowData();
+
+  // 13.5. Read and send DHT data
+  readDhtSensor(now);
+  sendUdpDhtData();
 
   // 14. Final poll before loop restart
   pollFlowSensor();
