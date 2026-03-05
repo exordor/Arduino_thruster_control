@@ -22,7 +22,7 @@
  *   - Ping format: PING\n (Jetson heartbeat to Arduino on 8889)
  *   - Status format: S <mode> <left_us> <right_us>\n
  *   - Flow data format: F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n
- *   - DHT data format: D <temp_c> <humidity>\n
+ *   - DHT data format: D <temp1> <hum1> <temp2> <hum2>\n (D12, D13)
  *   - Heartbeat: Arduino sends "HEARTBEAT\n" every 1s to both ports
  *   - Mode: 0=RC, 1=WiFi
  *
@@ -122,10 +122,11 @@ const unsigned long FLOW_CALC_INTERVAL_MS = 1000;    // Flow calculation window 
 const unsigned long FLOW_SEND_INTERVAL_MS = 200;      // Flow UDP send rate (5 Hz)
 
 // === DHT22 Configuration ===
-const byte DHT_PIN = 13;                              // D13 for DHT22 data
+const byte DHT_PIN_1 = 12;                             // D12 for DHT22 #1 data
+const byte DHT_PIN_2 = 13;                             // D13 for DHT22 #2 data
 #define DHT_TYPE DHT22
-const unsigned long DHT_READ_INTERVAL_MS = 2500;      // DHT22 max 0.5 Hz
-const unsigned long DHT_SEND_INTERVAL_MS = 1000;      // 1 Hz UDP send rate
+const unsigned long DHT_READ_INTERVAL_MS = 2500;       // DHT22 max 0.5 Hz
+const unsigned long DHT_SEND_INTERVAL_MS = 1000;       // 1 Hz UDP send rate
 
 // === Timing Constants ===
 const unsigned long RC_FAILSAFE_MS = 200;            // RC signal timeout
@@ -237,9 +238,12 @@ float flowVelocity = 0.0f;
 double totalLiters = 0.0;
 
 // === DHT22 State ===
-DHT dht(DHT_PIN, DHT_TYPE);
-float dhtTemperature = 0.0f;     // Celsius
-float dhtHumidity = 0.0f;        // Percentage
+DHT dht1(DHT_PIN_1, DHT_TYPE);
+DHT dht2(DHT_PIN_2, DHT_TYPE);
+float dht1Temperature = 0.0f;    // Celsius (sensor 1, D12)
+float dht1Humidity = 0.0f;       // Percentage (sensor 1, D12)
+float dht2Temperature = 0.0f;    // Celsius (sensor 2, D13)
+float dht2Humidity = 0.0f;       // Percentage (sensor 2, D13)
 unsigned long lastDhtReadMs = 0;
 unsigned long lastDhtSendMs = 0;
 
@@ -428,12 +432,20 @@ void readDhtSensor(unsigned long now) {
   }
   lastDhtReadMs = now;
 
-  float h = dht.readHumidity();
-  float t = dht.readTemperature();
+  // Read sensor 1 (D12)
+  float h1 = dht1.readHumidity();
+  float t1 = dht1.readTemperature();
+  if (!isnan(h1) && !isnan(t1)) {
+    dht1Humidity = h1;
+    dht1Temperature = t1;
+  }
 
-  if (!isnan(h) && !isnan(t)) {
-    dhtHumidity = h;
-    dhtTemperature = t;
+  // Read sensor 2 (D13)
+  float h2 = dht2.readHumidity();
+  float t2 = dht2.readTemperature();
+  if (!isnan(h2) && !isnan(t2)) {
+    dht2Humidity = h2;
+    dht2Temperature = t2;
   }
 }
 
@@ -662,9 +674,10 @@ void sendUdpDhtData() {
 
   lastDhtSendMs = now;
 
-  // Send DHT data: "D <temp_c> <humidity>\n"
-  char dhtBuf[32];
-  snprintf(dhtBuf, sizeof(dhtBuf), "D %.2f %.2f\n", dhtTemperature, dhtHumidity);
+  // Send DHT data: "D <temp1> <hum1> <temp2> <hum2>\n"
+  char dhtBuf[48];
+  snprintf(dhtBuf, sizeof(dhtBuf), "D %.2f %.2f %.2f %.2f\n",
+           dht1Temperature, dht1Humidity, dht2Temperature, dht2Humidity);
 
   udp.beginPacket(JETSON_IP, JETSON_PORT);
   udp.print(dhtBuf);
@@ -991,9 +1004,10 @@ void setup() {
   lastFlowState = digitalRead(FLOW_SENSOR_PIN);
   Serial.println("Flow meter sensor configured on D7");
 
-  // Initialize DHT sensor
-  dht.begin();
-  Serial.println("DHT22 sensor configured on D13");
+  // Initialize DHT sensors
+  dht1.begin();
+  dht2.begin();
+  Serial.println("DHT22 sensors configured on D12 and D13");
 
   // Connect to WiFi (try all networks in order)
   bool wifiConnected = connectToWiFi();
@@ -1026,7 +1040,7 @@ void setup() {
   Serial.println("\n=== System Ready ===");
   Serial.println("Control Priority: UDP > RC > Failsafe");
   Serial.println("Flow Meter: D7 polling mode, 1 Hz update rate");
-  Serial.println("DHT22: D13, 1 Hz update rate");
+  Serial.println("DHT22: D12 and D13, 1 Hz update rate");
   Serial.println("UDP: Listen 8888, Send S/F/D to 192.168.50.200:28888");
   Serial.println("     HEARTBEAT broadcast to 192.168.50.255:8889");
   Serial.println("     HEARTBEAT unicast to 192.168.50.200:28887 (Jetson)");
