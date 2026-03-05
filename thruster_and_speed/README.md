@@ -1,12 +1,13 @@
 # Thruster & Flow Meter Control (Arduino UNO R4 WiFi)
 
-A dual thruster control system with integrated flow meter sensor for Arduino UNO R4 WiFi, using dual-port UDP communication for low-latency real-time control.
+A dual thruster control system with integrated flow meter and DHT22 temperature/humidity sensors for Arduino UNO R4 WiFi, using dual-port UDP communication for low-latency real-time control.
 
 ## Features
 
 - **Dual Thruster Control**: Two ESC outputs for differential thrust
 - **RC Fallback**: Automatic switch to RC receiver when UDP timeout
 - **Flow Meter**: Real-time flow rate and volume measurement
+- **DHT22 Sensors**: Dual temperature and humidity monitoring (D12, D13)
 - **Dual-Port UDP**: Data (8888) and heartbeat (8889) separated for reliability
 - **PING Heartbeat (8889)**: Jetson keeps Arduino "online" without touching data port
 - **Multi-Network WiFi**: Auto-connect to configured networks with reconnection
@@ -20,6 +21,8 @@ A dual thruster control system with integrated flow meter sensor for Arduino UNO
 | ESC Right OUT | D9 | Output to right ESC |
 | ESC Left OUT | D10 | Output to left ESC |
 | **Flow Sensor** | **D7** | **Flow meter signal (polling mode)** |
+| **DHT22 #1** | **D12** | **Temperature/Humidity sensor #1** |
+| **DHT22 #2** | **D13** | **Temperature/Humidity sensor #2** |
 
 ## Specifications
 
@@ -29,6 +32,7 @@ A dual thruster control system with integrated flow meter sensor for Arduino UNO
 | Calibration factor (K) | 5 Hz per L/min |
 | Pulses per liter | 300 |
 | Flow update rate | 1 Hz |
+| **DHT22 update rate** | **1 Hz (read every 2.5s)** |
 | Status update rate | 10 Hz |
 | Heartbeat interval | 1000 ms |
 | UDP timeout | 2000 ms |
@@ -41,6 +45,8 @@ A dual thruster control system with integrated flow meter sensor for Arduino UNO
 
 ```
 Flow Sensor Signal  →  D7
+DHT22 #1 Data       →  D12
+DHT22 #2 Data       →  D13
 RC Receiver Right   →  D2
 RC Receiver Left    →  D3
 Right ESC           →  D9
@@ -76,6 +82,7 @@ The system uses two separate UDP ports for cleaner protocol separation:
 | Client → Arduino | `C <left_us> <right_us>\n` | Thruster command | **20ms min** |
 | Arduino → Client | `S <mode> <left_us> <right_us>\n` | Thruster status | 10 Hz |
 | Arduino → Client | `F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n` | Flow data | 5 Hz |
+| Arduino → Client | `D <temp1> <hum1> <temp2> <hum2>\n` | DHT data (to 28888, 28889) | 1 Hz |
 
 #### Heartbeat Port (8889)
 
@@ -99,6 +106,9 @@ S 1 1600 1600\n
 # Flow data (Arduino → Client, port 8888)
 F 25.50 5.10 0.1601 12.345\n
 
+# DHT data (Arduino → Client, port 28888 and 28889)
+D 25.30 65.00 24.80 68.50\n
+
 # Heartbeat (Arduino → Broadcast/Client, port 8889)
 HEARTBEAT\n
 ```
@@ -116,6 +126,10 @@ HEARTBEAT\n
 | | `<flow_lmin>` | float | Flow rate in L/min |
 | | `<velocity_ms>` | float | Velocity in m/s |
 | | `<total_liters>` | float | Accumulated volume in L |
+| `D` dht | `<temp1>` | float | Temperature from sensor #1 (°C, D12) |
+| | `<hum1>` | float | Humidity from sensor #1 (%, D12) |
+| | `<temp2>` | float | Temperature from sensor #2 (°C, D13) |
+| | `<hum2>` | float | Humidity from sensor #2 (%, D13) |
 
 ## Connection Detection & Handshake
 
@@ -207,12 +221,13 @@ Edit the `wifiNetworks[]` array in the code to add your networks.
 Connect via USB at 115200 baud for debugging:
 
 ```
-=== WiFi UDP + RC Thruster Control + Flow Meter ===
+=== WiFi UDP + RC Thruster Control + Flow Meter + DHT22 ===
 RC Control Mode: Gear Mode (9 gears, 100µs intervals)
 
 RC input pins configured
 RC interrupts attached
 Flow meter sensor configured on D7
+DHT22 sensors configured on D12 and D13
 
 Connected!
   Network: IGE-Geomatics-sense-mobile
@@ -227,10 +242,12 @@ ESCs initialized to neutral (1500 µs)
 
 === System Ready ===
 Control Priority: UDP > RC > Failsafe
-RC Filter: 25% alpha, ±40µs deadband (smooth, drift-resistant)
-WiFi Filter: 100% alpha, 20ms min interval (direct)
 Flow Meter: D7 polling mode, 1 Hz update rate
-Heartbeat: 1000ms (port 8889), Timeout: 2000ms
+DHT22: D12 and D13, 1 Hz update rate
+UDP: Listen 8888, Send S/F/D to 192.168.50.200:28888
+     DHT also sent to 192.168.50.200:28889 (monitor)
+     HEARTBEAT broadcast to 192.168.50.255:8889
+     HEARTBEAT unicast to 192.168.50.200:28887 (Jetson)
 ```
 
 ## Python Client Example
@@ -273,6 +290,8 @@ while True:
             print(f"[STATUS] {msg}")
         elif msg.startswith('F '):
             print(f"[FLOW] {msg}")
+        elif msg.startswith('D '):
+            print(f"[DHT] {msg}")
 ```
 
 ### Using the Test Script
@@ -426,6 +445,14 @@ const int DEADBAND_US = 40;            // Deadband around center (20-100µs)
 - Verify RC receiver connected to D2 and D3
 - Check RC receiver is bound (TX light on)
 - Verify PWM output range (1000-2000µs)
+
+### No DHT data
+
+- Verify DHT22 sensors connected to D12 and D13
+- Check sensor power supply (3.3V or 5V)
+- Add 10kΩ pull-up resistor between DATA and VCC if not built into module
+- DHT22 requires 2+ seconds between reads (reading too fast returns NaN)
+- Check DHT library is installed in Arduino IDE
 
 ## License
 
