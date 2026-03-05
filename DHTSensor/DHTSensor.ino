@@ -10,7 +10,7 @@ DHT dht12(DHTPIN_12, DHTTYPE);
 DHT dht13(DHTPIN_13, DHTTYPE);
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   while (!Serial) {
     ; // 等待串口连接
   }
