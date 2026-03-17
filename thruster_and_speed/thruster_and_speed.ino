@@ -381,21 +381,7 @@ inline void pollFlowSensor() {
   }
 }
 
-// Update flow meter by polling D7 for state changes
-void updateFlowMeter() {
-  unsigned long now = millis();
-
-  // Multiple samples for better capture rate
-  for (int i = 0; i < 5; i++) {
-    pollFlowSensor();
-    delayMicroseconds(10);  // 10us delay between reads (total ~50us)
-  }
-
-  // Calculate flow rate at specified interval (1s window for accurate pulse counting)
-  calculateFlowData(now);
-}
-
-// Separate calculation function (called by updateFlowMeter)
+// Calculate flow rate at specified interval (1s window for accurate pulse counting)
 void calculateFlowData(unsigned long now) {
   if (now - lastFlowCalcMs >= FLOW_CALC_INTERVAL_MS) {
     unsigned long dtMs = now - lastFlowCalcMs;
