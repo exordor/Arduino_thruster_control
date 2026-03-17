@@ -227,11 +227,11 @@ int currentMode = 0;  // 0=RC, 1=WiFi
 
 // Status sending
 unsigned long lastStatusSendMs = 0;
-unsigned long lastMonitorSendMs = 0;
+unsigned long lastMonitorSendMs = 0 - MONITOR_SEND_INTERVAL_MS;  // Allow immediate first send
 
 // === Flow Meter State ===
 unsigned long lastFlowCalcMs = 0;     // Last time flow data was calculated
-unsigned long lastFlowSendMs = 0;     // Last time flow data was sent via UDP
+unsigned long lastFlowSendMs = 0 - FLOW_SEND_INTERVAL_MS;  // Allow immediate first send
 int lastFlowState = 0;
 unsigned long flowChangeCount = 0;
 float flowFreqHz = 0.0f;
@@ -246,8 +246,8 @@ float dht1Temperature = 0.0f;    // Celsius (sensor 1, D12)
 float dht1Humidity = 0.0f;       // Percentage (sensor 1, D12)
 float dht2Temperature = 0.0f;    // Celsius (sensor 2, D13)
 float dht2Humidity = 0.0f;       // Percentage (sensor 2, D13)
-unsigned long lastDhtReadMs = 0;
-unsigned long lastDhtSendMs = 0;
+unsigned long lastDhtReadMs = 0 - DHT_READ_INTERVAL_MS;  // Allow immediate first read
+unsigned long lastDhtSendMs = 0 - DHT_SEND_INTERVAL_MS;  // Allow immediate first send
 
 // === Helper Functions ===
 
@@ -410,8 +410,7 @@ void calculateFlowData(unsigned long now) {
     flowFreqHz = freqHz;
 
     // Flow rate: Q(L/min) = f(Hz) / 5
-    float flowLmin = freqHz / K_HZ_PER_LMIN;
-    flowLmin = flowLmin;
+    flowLmin = freqHz / K_HZ_PER_LMIN;
 
     // Velocity calculation
     float flow_m3s = (flowLmin * 0.001f) / 60.0f;
@@ -1036,7 +1035,7 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
 
-  Serial.println("\n=== WiFi UDP + RC Thruster Control + Flow Meter ===");
+  Serial.println("\n=== WiFi UDP + RC Thruster Control + Flow Meter + DHT22 ===");
   Serial.print("RC Control Mode: ");
   Serial.println(ENABLE_GEAR_MODE ? "Gear Mode (9 gears, 100µs intervals)" : "Continuous Mode");
   Serial.println();
