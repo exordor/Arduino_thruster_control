@@ -129,6 +129,9 @@ const unsigned long DHT_READ_INTERVAL_MS = 2500;       // DHT22 max 0.5 Hz
 const unsigned long DHT_SEND_INTERVAL_MS = 1000;       // 1 Hz UDP send rate
 
 // === Timing Constants ===
+// Debug level: 0=Minimal (errors only), 1=Basic (sensors+status), 2=Verbose (all UDP)
+#define DEBUG_LEVEL 1
+
 const unsigned long RC_FAILSAFE_MS = 200;            // RC signal timeout
 const unsigned long UDP_TIMEOUT_MS = 2000;           // UDP timeout (2s without data = offline)
 const unsigned long JETSON_ONLINE_TIMEOUT_MS = 2000; // Jetson online if ping/command seen recently
@@ -533,10 +536,15 @@ void readUdpCommands() {
             haveWifiCmd = true;
             lastJetsonPingMs = now;
 
-            Serial.print("UDP Command: Left=");
-            Serial.print(wifiOutL);
-            Serial.print(" Right=");
-            Serial.println(wifiOutR);
+            // Debug: Show received command (rate limited to prevent flooding)
+            static unsigned long lastUdpDebugMs = 0;
+            if (DEBUG_LEVEL >= 2 && now - lastUdpDebugMs >= 200) {  // Max 5 Hz output
+              lastUdpDebugMs = now;
+              Serial.print("[UDP CMD] L=");
+              Serial.print(wifiOutL);
+              Serial.print(" R=");
+              Serial.println(wifiOutR);
+            }
           }
         }
       }
@@ -1159,14 +1167,63 @@ void loop() {
     prevWifiLink = wifiLink;
   }
 
-  // Debug: Print WiFi command age
+  // Debug output (configurable level)
   static unsigned long lastDebugMs = 0;
   if (now - lastDebugMs >= 1000) {  // Print every 1 second
-    unsigned long cmdAge = haveWifiCmd ? (now - lastWifiCmdMs) : 0;
-    Serial.print("WiFi cmd age: ");
-    Serial.print(cmdAge);
-    Serial.print(" ms | Mode: ");
-    Serial.println(currentMode == 1 ? "WiFi" : "RC");
     lastDebugMs = now;
+
+    // DEBUG_LEVEL 0: No periodic output
+    // DEBUG_LEVEL 1: Basic status + sensors
+    // DEBUG_LEVEL 2: Verbose (all info)
+
+    if (DEBUG_LEVEL >= 1) {
+      // Basic: Mode and WiFi status
+      Serial.print("[");
+      Serial.print(currentMode == 1 ? "WiFi" : "RC");
+      Serial.print("] ");
+
+      // WiFi cmd age
+      if (currentMode == 1) {
+        unsigned long cmdAge = haveWifiCmd ? (now - lastWifiCmdMs) : 0;
+        Serial.print("cmd:");
+        Serial.print(cmdAge);
+        Serial.print("ms ");
+      }
+
+      // Flow data
+      Serial.print("| Flow:");
+      Serial.print(flowLmin, 2);
+      Serial.print("L/min ");
+      Serial.print(flowVelocity, 3);
+      Serial.print("m/s ");
+      Serial.print(totalLiters, 2);
+      Serial.print("L ");
+
+      // DHT data
+      Serial.print("| DHT1:");
+      Serial.print(dht1Temperature, 1);
+      Serial.print("C ");
+      Serial.print(dht1Humidity, 0);
+      Serial.print("% ");
+      Serial.print("DHT2:");
+      Serial.print(dht2Temperature, 1);
+      Serial.print("C ");
+      Serial.print(dht2Humidity, 0);
+      Serial.print("%");
+
+      Serial.println();
+    }
+
+    if (DEBUG_LEVEL >= 2) {
+      // Verbose: Additional details
+      Serial.print("  [VERBOSE] ESC L:");
+      Serial.print(currentLeftUs);
+      Serial.print(" R:");
+      Serial.print(currentRightUs);
+      Serial.print(" | Jetson:");
+      Serial.print(isJetsonOnline(now) ? "ON" : "OFF");
+      Serial.print(" | Monitor sent:");
+      Serial.println(now - lastMonitorSendMs < 1100 ? "OK" : "SKIP");
+    }
   }
 }
