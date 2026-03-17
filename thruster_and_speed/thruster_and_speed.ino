@@ -1151,6 +1151,9 @@ void loop() {
   readDhtSensor(now);
   sendUdpDhtData();
 
+  // 13.6. Send all data to monitor port (28889) at 1 Hz
+  sendToMonitorPort();
+
   // 14. Final poll before loop restart
   pollFlowSensor();
 
