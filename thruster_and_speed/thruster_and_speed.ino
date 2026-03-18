@@ -81,13 +81,20 @@ WifiNetwork wifiNetworks[MAX_WIFI_NETWORKS] = {
 int currentNetworkIndex = -1;
 
 // WiFi auto-reconnect configuration
-const unsigned long WIFI_CHECK_INTERVAL_MS = 2000;  // Check WiFi every 2 seconds
+const unsigned long WIFI_CHECK_INTERVAL_MS = 250;   // Background WiFi state machine tick
 const unsigned long WIFI_RECONNECT_DELAY_MS = 5000; // Wait 5s before reconnect attempt
-const int MAX_RECONNECT_ATTEMPTS = 3;               // Max reconnect attempts per network
+const int MAX_RECONNECT_ATTEMPTS = 3;               // Max full background scan cycles before pausing
+const unsigned long WIFI_CONNECT_ATTEMPT_TIMEOUT_MS = 10000; // Per-network connection timeout
 unsigned long lastWifiCheckMs = 0;
 unsigned long lastWifiDisconnectMs = 0;
 int reconnectAttemptCount = 0;
 bool reconnectInProgress = false;
+bool wifiAttemptActive = false;
+unsigned long wifiAttemptStartMs = 0;
+int wifiAttemptNetworkIndex = -1;
+int wifiCycleStartIndex = -1;
+int wifiNetworksTriedThisCycle = 0;
+bool udpServersStarted = false;
 
 // UDP Configuration
 const unsigned int UDP_PORT = 8888;         // Data port (commands, status, flow)
@@ -152,7 +159,7 @@ const int ESC_MIN = 1100;
 const int ESC_MID = 1500;
 const int ESC_MAX = 1900;
 const unsigned long ESC_PWM_PERIOD_US = 20000;           // 50 Hz ESC update period
-const unsigned long ESC_SAFE_BOOT_NEUTRAL_MS = 5000; // Hold neutral immediately on boot before any slow init
+const unsigned long ESC_SAFE_BOOT_NEUTRAL_MS = 2000; // Hold neutral briefly on boot so ESCs can arm before control starts
 const int DEADBAND_US = 40;  // Increased deadband to resist joystick drift (±40µs around center)
 const int RC_EXIT_NEUTRAL_DEADBAND_US = 70;   // Must move this far from 1500 before RC can leave neutral
 const int RC_RETURN_NEUTRAL_DEADBAND_US = 45; // Return-to-neutral hysteresis for RC input
@@ -980,148 +987,193 @@ void updateThrusters() {
 
 // === WiFi Multi-Network Management ===
 
-// Try to reconnect to WiFi (attempt previously connected network first)
-bool reconnectWiFi() {
-  unsigned long now = millis();
-
-  // Wait before reconnect attempt
-  if (now - lastWifiDisconnectMs < WIFI_RECONNECT_DELAY_MS) {
-    return false;
-  }
-
-  Serial.println("\n=== WiFi Reconnection Attempt ===");
-
-  // Try to reconnect to the previously connected network first
-  if (currentNetworkIndex >= 0) {
-    Serial.print("Reconnecting to: ");
-    Serial.println(wifiNetworks[currentNetworkIndex].ssid);
-
-    // Configure IP
-    if (!wifiNetworks[currentNetworkIndex].use_dhcp) {
-      WiFi.config(wifiNetworks[currentNetworkIndex].local_ip,
-                  wifiNetworks[currentNetworkIndex].gateway,
-                  wifiNetworks[currentNetworkIndex].subnet);
-    }
-
-    // Disconnect first, then attempt reconnection
-    WiFi.disconnect();
-    delay(100);
-    WiFi.begin(wifiNetworks[currentNetworkIndex].ssid,
-               wifiNetworks[currentNetworkIndex].password);
-
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
-      delay(500);
-      Serial.print(".");
-      attempts++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\nReconnected!");
-      reconnectAttemptCount = 0;
-      reconnectInProgress = false;
-
-      // Restart UDP servers
-      udp.begin(UDP_PORT);
-      udpHeartbeat.begin(HEARTBEAT_PORT);
-      Serial.print("UDP servers restarted on ports ");
-      Serial.print(UDP_PORT);
-      Serial.print(" (data), ");
-      Serial.println(HEARTBEAT_PORT);
-      Serial.println(" (heartbeat)");
-
-      return true;
-    }
-
-    Serial.println("\nReconnect failed, trying other networks...");
-  }
-
-  // If reconnect to previous network failed, try all networks
-  reconnectAttemptCount++;
-  if (reconnectAttemptCount >= MAX_RECONNECT_ATTEMPTS) {
-    Serial.println("Max reconnect attempts reached. Waiting...");
-    reconnectInProgress = false;
-    reconnectAttemptCount = 0;
-    return false;
-  }
-
-  // Try all networks in order
-  for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
-    // Skip empty entries
-    if (wifiNetworks[i].ssid == nullptr || strlen(wifiNetworks[i].ssid) == 0) {
-      continue;
-    }
-
-    // Skip the network we just tried to reconnect to
-    if (i == currentNetworkIndex) {
-      continue;
-    }
-
-    Serial.print("Trying network [");
-    Serial.print(i + 1);
-    Serial.print("/");
-    Serial.print(MAX_WIFI_NETWORKS);
-    Serial.print("]: ");
-    Serial.println(wifiNetworks[i].ssid);
-
-    // Configure IP
-    if (!wifiNetworks[i].use_dhcp) {
-      WiFi.config(wifiNetworks[i].local_ip,
-                  wifiNetworks[i].gateway,
-                  wifiNetworks[i].subnet);
-    } else {
-      WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
-    }
-
-    // Attempt connection
-    WiFi.begin(wifiNetworks[i].ssid, wifiNetworks[i].password);
-
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
-      delay(500);
-      Serial.print(".");
-      attempts++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\nConnected!");
-      Serial.print("  Network: ");
-      Serial.println(wifiNetworks[i].ssid);
-      Serial.print("  IP Address: ");
-      Serial.println(WiFi.localIP());
-      Serial.print("  RSSI: ");
-      Serial.print(WiFi.RSSI());
-      Serial.println(" dBm");
-
-      currentNetworkIndex = i;
-      reconnectAttemptCount = 0;
-      reconnectInProgress = false;
-
-      // Start UDP servers
-      udp.begin(UDP_PORT);
-      udpHeartbeat.begin(HEARTBEAT_PORT);
-      Serial.print("UDP servers started on ports ");
-      Serial.print(UDP_PORT);
-      Serial.print(" (data), ");
-      Serial.println(HEARTBEAT_PORT);
-      Serial.println(" (heartbeat)");
-
-      return true;
-    }
-
-    WiFi.disconnect();
-    delay(500);
-  }
-
-  Serial.println("\nAll networks unavailable");
-  return false;
+bool isWifiNetworkConfigured(int index) {
+  return index >= 0 &&
+         index < MAX_WIFI_NETWORKS &&
+         wifiNetworks[index].ssid != nullptr &&
+         strlen(wifiNetworks[index].ssid) > 0;
 }
 
-// Check WiFi status and trigger reconnection if needed
+int countConfiguredWifiNetworks() {
+  int count = 0;
+  for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
+    if (isWifiNetworkConfigured(i)) {
+      count++;
+    }
+  }
+  return count;
+}
+
+int findFirstConfiguredWifiNetwork() {
+  for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
+    if (isWifiNetworkConfigured(i)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+int findNextConfiguredWifiNetwork(int startAfter) {
+  for (int offset = 1; offset <= MAX_WIFI_NETWORKS; offset++) {
+    int idx = (startAfter + offset + MAX_WIFI_NETWORKS) % MAX_WIFI_NETWORKS;
+    if (isWifiNetworkConfigured(idx)) {
+      return idx;
+    }
+  }
+  return -1;
+}
+
+void configureWifiForNetwork(int index) {
+  if (!isWifiNetworkConfigured(index)) {
+    return;
+  }
+
+  if (!wifiNetworks[index].use_dhcp) {
+    Serial.print("  Using static IP: ");
+    Serial.println(wifiNetworks[index].local_ip);
+    WiFi.config(wifiNetworks[index].local_ip,
+                wifiNetworks[index].gateway,
+                wifiNetworks[index].subnet);
+  } else {
+    Serial.println("  Using DHCP");
+    WiFi.config(IPAddress(0, 0, 0, 0),
+                IPAddress(0, 0, 0, 0),
+                IPAddress(0, 0, 0, 0));
+  }
+}
+
+void printWifiConnectedInfo(int index) {
+  Serial.println("\nWiFi connected");
+  if (isWifiNetworkConfigured(index)) {
+    Serial.print("  Network: ");
+    Serial.println(wifiNetworks[index].ssid);
+  }
+  Serial.print("  IP Address: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("  Gateway: ");
+  Serial.println(WiFi.gatewayIP());
+  Serial.print("  Subnet: ");
+  Serial.println(WiFi.subnetMask());
+  Serial.print("  RSSI: ");
+  Serial.print(WiFi.RSSI());
+  Serial.println(" dBm");
+}
+
+void ensureUdpServersStarted() {
+  if (udpServersStarted || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  udp.begin(UDP_PORT);
+  udpHeartbeat.begin(HEARTBEAT_PORT);
+  udpServersStarted = true;
+
+  Serial.print("Data UDP server started on port ");
+  Serial.println(UDP_PORT);
+  Serial.print("Heartbeat server started on port ");
+  Serial.println(HEARTBEAT_PORT);
+  Serial.println("Ready for UDP control commands");
+}
+
+void resetWifiAttemptState() {
+  wifiAttemptActive = false;
+  wifiAttemptStartMs = 0;
+  wifiAttemptNetworkIndex = -1;
+  wifiCycleStartIndex = -1;
+  wifiNetworksTriedThisCycle = 0;
+}
+
+void startWifiAttempt(int index, unsigned long now) {
+  if (!isWifiNetworkConfigured(index)) {
+    return;
+  }
+
+  int configuredCount = countConfiguredWifiNetworks();
+  wifiAttemptActive = true;
+  wifiAttemptStartMs = now;
+  wifiAttemptNetworkIndex = index;
+
+  Serial.print("WiFi connect attempt [");
+  Serial.print(wifiNetworksTriedThisCycle + 1);
+  Serial.print("/");
+  Serial.print(configuredCount);
+  Serial.print("]: ");
+  Serial.println(wifiNetworks[index].ssid);
+
+  WiFi.disconnect();
+  configureWifiForNetwork(index);
+  WiFi.begin(wifiNetworks[index].ssid, wifiNetworks[index].password);
+}
+
+bool startNextWifiAttempt(unsigned long now) {
+  int configuredCount = countConfiguredWifiNetworks();
+  if (configuredCount == 0 || wifiNetworksTriedThisCycle >= configuredCount) {
+    return false;
+  }
+
+  int nextIndex = wifiAttemptNetworkIndex;
+  if (wifiNetworksTriedThisCycle == 0) {
+    nextIndex = wifiCycleStartIndex;
+  } else {
+    nextIndex = findNextConfiguredWifiNetwork(wifiAttemptNetworkIndex);
+  }
+
+  if (!isWifiNetworkConfigured(nextIndex)) {
+    return false;
+  }
+
+  startWifiAttempt(nextIndex, now);
+  return true;
+}
+
+void beginWifiReconnectCycle(unsigned long now, bool immediate) {
+  int configuredCount = countConfiguredWifiNetworks();
+  if (configuredCount == 0) {
+    currentNetworkIndex = -1;
+    reconnectInProgress = false;
+    resetWifiAttemptState();
+    return;
+  }
+
+  reconnectInProgress = true;
+  wifiCycleStartIndex = isWifiNetworkConfigured(currentNetworkIndex)
+                          ? currentNetworkIndex
+                          : findFirstConfiguredWifiNetwork();
+  wifiAttemptNetworkIndex = -1;
+  wifiNetworksTriedThisCycle = 0;
+  wifiAttemptActive = false;
+  wifiAttemptStartMs = 0;
+
+  Serial.println("\n=== WiFi Background Connect ===");
+  if (immediate) {
+    startNextWifiAttempt(now);
+  }
+}
+
+void finishWifiReconnectCycle(unsigned long now) {
+  reconnectInProgress = false;
+  resetWifiAttemptState();
+  reconnectAttemptCount++;
+  lastWifiDisconnectMs = now;
+
+  if (reconnectAttemptCount >= MAX_RECONNECT_ATTEMPTS) {
+    Serial.print("WiFi unavailable after ");
+    Serial.print(MAX_RECONNECT_ATTEMPTS);
+    Serial.println(" background scan cycles; continuing RC-only and retrying later");
+    reconnectAttemptCount = 0;
+  } else {
+    Serial.print("WiFi scan cycle failed (");
+    Serial.print(reconnectAttemptCount);
+    Serial.print("/");
+    Serial.print(MAX_RECONNECT_ATTEMPTS);
+    Serial.println("); RC remains active");
+  }
+}
+
+// Check WiFi status and advance the non-blocking background connection state
 void checkWiFiStatus() {
   unsigned long now = millis();
 
-  // Only check at intervals
   if (now - lastWifiCheckMs < WIFI_CHECK_INTERVAL_MS) {
     return;
   }
@@ -1129,92 +1181,60 @@ void checkWiFiStatus() {
 
   bool wifiConnected = (WiFi.status() == WL_CONNECTED);
 
-  if (!wifiConnected && !reconnectInProgress) {
-    // WiFi disconnected - start reconnection process
-    if (lastWifiDisconnectMs == 0) {
-      lastWifiDisconnectMs = now;
-      Serial.println("\nWiFi link lost!");
+  if (wifiConnected) {
+    bool hadPreviousWifiSession = currentNetworkIndex >= 0;
+    if (wifiAttemptActive && isWifiNetworkConfigured(wifiAttemptNetworkIndex)) {
+      currentNetworkIndex = wifiAttemptNetworkIndex;
     }
 
-    reconnectInProgress = true;
-    reconnectWiFi();
-  } else if (wifiConnected) {
-    // WiFi connected - reset disconnect timer
-    if (lastWifiDisconnectMs > 0) {
-      Serial.println("\nWiFi link restored");
+    if (lastWifiDisconnectMs > 0 || !udpServersStarted) {
+      printWifiConnectedInfo(currentNetworkIndex);
+      if (lastWifiDisconnectMs > 0 && hadPreviousWifiSession) {
+        Serial.println("WiFi link restored");
+      }
     }
+
     lastWifiDisconnectMs = 0;
-    reconnectInProgress = false;
     reconnectAttemptCount = 0;
-  }
-}
-
-// Try to connect to WiFi networks in order until successful
-bool connectToWiFi() {
-  Serial.println("\n=== Attempting WiFi Connection ===");
-
-  for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
-    // Skip empty entries
-    if (wifiNetworks[i].ssid == nullptr || strlen(wifiNetworks[i].ssid) == 0) {
-      continue;
-    }
-
-    Serial.print("Trying network [");
-    Serial.print(i + 1);
-    Serial.print("/");
-    Serial.print(MAX_WIFI_NETWORKS);
-    Serial.print("]: ");
-    Serial.println(wifiNetworks[i].ssid);
-
-    // Configure IP based on network settings
-    if (!wifiNetworks[i].use_dhcp) {
-      Serial.print("  Using static IP: ");
-      Serial.println(wifiNetworks[i].local_ip);
-      WiFi.config(wifiNetworks[i].local_ip, wifiNetworks[i].gateway, wifiNetworks[i].subnet);
-    } else {
-      Serial.println("  Using DHCP");
-      WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
-    }
-
-    // Attempt connection
-    WiFi.begin(wifiNetworks[i].ssid, wifiNetworks[i].password);
-
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-      delay(500);
-      Serial.print(".");
-      attempts++;
-    }
-
-    // Check if connection successful
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\nConnected!");
-      Serial.print("  Network: ");
-      Serial.println(wifiNetworks[i].ssid);
-      Serial.print("  IP Address: ");
-      Serial.println(WiFi.localIP());
-      Serial.print("  Gateway: ");
-      Serial.println(WiFi.gatewayIP());
-      Serial.print("  Subnet: ");
-      Serial.println(WiFi.subnetMask());
-      Serial.print("  RSSI: ");
-      Serial.print(WiFi.RSSI());
-      Serial.println(" dBm");
-
-      currentNetworkIndex = i;
-      return true;
-    } else {
-      Serial.println("\nConnection failed");
-    }
-
-    // Disconnect before trying next network
-    WiFi.disconnect();
-    delay(500);
+    reconnectInProgress = false;
+    resetWifiAttemptState();
+    ensureUdpServersStarted();
+    return;
   }
 
-  Serial.println("\nAll WiFi connection attempts failed");
-  currentNetworkIndex = -1;
-  return false;
+  udpServersStarted = false;
+
+  if (lastWifiDisconnectMs == 0) {
+    lastWifiDisconnectMs = now;
+    Serial.println("\nWiFi not connected - RC remains active while background connect runs");
+  }
+
+  if (wifiAttemptActive) {
+    if (now - wifiAttemptStartMs >= WIFI_CONNECT_ATTEMPT_TIMEOUT_MS) {
+      Serial.print("WiFi attempt timed out: ");
+      Serial.println(wifiNetworks[wifiAttemptNetworkIndex].ssid);
+      WiFi.disconnect();
+      wifiAttemptActive = false;
+      wifiAttemptStartMs = 0;
+      wifiNetworksTriedThisCycle++;
+
+      if (!startNextWifiAttempt(now)) {
+        finishWifiReconnectCycle(now);
+      }
+    }
+    return;
+  }
+
+  if (!reconnectInProgress) {
+    if (now - lastWifiDisconnectMs < WIFI_RECONNECT_DELAY_MS) {
+      return;
+    }
+    beginWifiReconnectCycle(now, false);
+  }
+
+  if (!startNextWifiAttempt(now)) {
+    finishWifiReconnectCycle(now);
+  }
 }
 
 // === Setup ===
@@ -1277,22 +1297,14 @@ void setup() {
   Serial.println(" ms");
   delay(ESC_SAFE_BOOT_NEUTRAL_MS);
 
-  // Connect to WiFi (try all networks in order) only after ESC outputs are stable.
-  bool wifiConnected = connectToWiFi();
-
-  if (wifiConnected) {
-    // Start data UDP server (commands, status, flow)
-    udp.begin(UDP_PORT);
-    Serial.print("Data UDP server started on port ");
-    Serial.println(UDP_PORT);
-
-    // Start heartbeat UDP server
-    udpHeartbeat.begin(HEARTBEAT_PORT);
-    Serial.print("Heartbeat server started on port ");
-    Serial.println(HEARTBEAT_PORT);
-    Serial.println("Ready for UDP control commands");
+  // Start WiFi in the background so RC is usable immediately after setup finishes.
+  int configuredWifiCount = countConfiguredWifiNetworks();
+  if (configuredWifiCount > 0) {
+    Serial.println("WiFi background connect enabled - RC available immediately");
+    lastWifiDisconnectMs = millis();
+    beginWifiReconnectCycle(millis(), true);
   } else {
-    Serial.println("WiFi unavailable - Running in RC only mode");
+    Serial.println("No WiFi networks configured - Running in RC only mode");
   }
 
   Serial.println("\n=== System Ready ===");
@@ -1318,63 +1330,63 @@ void loop() {
   // 0. Poll flow sensor (lightweight, high frequency)
   pollFlowSensor();
 
-  // 1. Check WiFi status and auto-reconnect if needed
-  checkWiFiStatus();
-
-  // 2. Poll again after WiFi check (may have missed pulses)
-  pollFlowSensor();
-
-  // 3. Read RC inputs (non-blocking with interrupts)
+  // 1. Read RC inputs first so manual control stays responsive even during WiFi retries
   readRcInputs();
 
-  // 4. Read UDP commands (may block!)
-  readUdpCommands();
+  // 2. Check WiFi status and auto-reconnect in the background
+  checkWiFiStatus();
 
-  // 5. Read heartbeat ping (UDP 8889)
-  readHeartbeatPing();
-
-  // 6. Poll again after UDP read (critical - UDP can block)
+  // 3. Poll again after WiFi check (may have missed pulses)
   pollFlowSensor();
 
-  // 7. Send heartbeat (may block!)
+  // 4. Read UDP commands and heartbeat only after sockets are ready
+  if (udpServersStarted) {
+    readUdpCommands();
+    readHeartbeatPing();
+  }
+
+  // 5. Poll again after UDP read (critical - UDP can block)
+  pollFlowSensor();
+
+  // 6. Send heartbeat (may block!)
   sendHeartbeat();
 
-  // 8. Poll again after heartbeat
+  // 7. Poll again after heartbeat
   pollFlowSensor();
 
-  // 9. Determine control mode and outputs (fast)
+  // 8. Determine control mode and outputs (fast)
   determineControlMode();
 
-  // 10. Update thrusters (fast)
+  // 9. Update thrusters (fast)
   updateThrusters();
 
-  // 10.5. Dedicated PWM debug stream for investigating twitching
+  // 9.5. Dedicated PWM debug stream for investigating twitching
   printPwmEventDebug();
   printPwmDebug(now);
 
-  // 11. Send status to Jetson (may block!)
+  // 10. Send status to Jetson (may block!)
   sendUdpStatus();
 
-  // 12. Poll again after status send
+  // 11. Poll again after status send
   pollFlowSensor();
 
-  // 13. Send flow data to Jetson (may block!)
+  // 12. Send flow data to Jetson (may block!)
   sendUdpFlowData();
 
-  // 13.5. Read and send DHT data
+  // 12.5. Read and send DHT data
   readDhtSensor(now);
   sendUdpDhtData();
 
-  // 13.6. Send all data to monitor port (28889) at 1 Hz
+  // 12.6. Send all data to monitor port (28889) at 1 Hz
   sendToMonitorPort();
 
-  // 14. Final poll before loop restart
+  // 13. Final poll before loop restart
   pollFlowSensor();
 
-  // 15. Calculate flow data (do this once per loop)
+  // 14. Calculate flow data (do this once per loop)
   calculateFlowData(now);
 
-  // 16. Connection state transitions (fast)
+  // 15. Connection state transitions (fast)
   bool wifiLink = (WiFi.status() == WL_CONNECTED);
   static bool prevWifiLink = false;
   static bool stateInit = false;
