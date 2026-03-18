@@ -1,4 +1,5 @@
 #include <WiFiS3.h>
+#include "Arduino_LED_Matrix.h"
 #include "pwm.h"
 #include <WiFiUdp.h>
 #include "DHT.h"
@@ -85,8 +86,10 @@ const unsigned long WIFI_CHECK_INTERVAL_MS = 250;   // Background WiFi state mac
 const unsigned long WIFI_RECONNECT_DELAY_MS = 5000; // Wait 5s before reconnect attempt
 const int MAX_RECONNECT_ATTEMPTS = 3;               // Max full background scan cycles before pausing
 const unsigned long WIFI_CONNECT_ATTEMPT_TIMEOUT_MS = 10000; // Per-network connection timeout
+const unsigned long WIFI_UDP_START_DELAY_MS = 300;  // Let the network stack settle briefly before binding UDP sockets
 unsigned long lastWifiCheckMs = 0;
 unsigned long lastWifiDisconnectMs = 0;
+unsigned long wifiConnectedAtMs = 0;
 int reconnectAttemptCount = 0;
 bool reconnectInProgress = false;
 bool wifiAttemptActive = false;
@@ -152,6 +155,29 @@ const int DECAY_STEP_US = 5;                         // Soft decay step toward 1
 const unsigned long STATUS_SEND_INTERVAL_MS = 100;   // Status update rate (10Hz)
 const unsigned long MONITOR_SEND_INTERVAL_MS = 1000;  // Monitor port update rate (1Hz)
 
+// === WiFi LED Matrix Indicator ===
+const unsigned long WIFI_MATRIX_BLINK_INTERVAL_MS = 120;
+uint8_t WIFI_MATRIX_ICON[8][12] = {
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+  {0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0},
+  {0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0},
+  {0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0},
+  {0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0},
+  {0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+};
+uint8_t WIFI_MATRIX_OFF[8][12] = {
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+};
+
 // === ESC Configuration ===
 const int RX_VALID_MIN = 950;
 const int RX_VALID_MAX = 2000;
@@ -169,7 +195,11 @@ const byte RC_OFFCENTER_CONFIRM_FRAMES = 2;   // Require consecutive off-center 
 // === ESC PWM Outputs ===
 PwmOut escL(ESC_LEFT_OUT);
 PwmOut escR(ESC_RIGHT_OUT);
+ArduinoLEDMatrix ledMatrix;
 bool escPwmInitialized = false;
+bool ledMatrixInitialized = false;
+bool wifiMatrixBlinkVisible = false;
+unsigned long lastWifiMatrixBlinkMs = 0;
 
 // === RC State Variables ===
 // RC state - interrupt-based capture
@@ -495,6 +525,68 @@ void printPwmEventDebug() {
   lastOutL = currentLeftUs;
   lastOutR = currentRightUs;
   lastMode = currentMode;
+}
+
+void renderWifiStatusMatrix(bool lit) {
+  if (!ledMatrixInitialized) {
+    return;
+  }
+
+  if (lit) {
+    ledMatrix.renderBitmap(WIFI_MATRIX_ICON, 8, 12);
+  } else {
+    ledMatrix.renderBitmap(WIFI_MATRIX_OFF, 8, 12);
+  }
+}
+
+void updateWifiStatusMatrix(unsigned long now) {
+  if (!ledMatrixInitialized) {
+    return;
+  }
+
+  enum WifiMatrixMode {
+    WIFI_MATRIX_MODE_OFF = 0,
+    WIFI_MATRIX_MODE_BLINK = 1,
+    WIFI_MATRIX_MODE_SOLID = 2
+  };
+  static int lastMode = WIFI_MATRIX_MODE_OFF;
+
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+  bool shouldBlink = !wifiConnected &&
+                     countConfiguredWifiNetworks() > 0 &&
+                     (wifiAttemptActive || reconnectInProgress || lastWifiDisconnectMs > 0);
+
+  if (wifiConnected) {
+    if (lastMode != WIFI_MATRIX_MODE_SOLID) {
+      renderWifiStatusMatrix(true);
+      wifiMatrixBlinkVisible = true;
+    }
+    lastMode = WIFI_MATRIX_MODE_SOLID;
+    return;
+  }
+
+  if (!shouldBlink) {
+    if (lastMode != WIFI_MATRIX_MODE_OFF) {
+      renderWifiStatusMatrix(false);
+      wifiMatrixBlinkVisible = false;
+    }
+    lastMode = WIFI_MATRIX_MODE_OFF;
+    return;
+  }
+
+  if (lastMode != WIFI_MATRIX_MODE_BLINK) {
+    wifiMatrixBlinkVisible = true;
+    lastWifiMatrixBlinkMs = now;
+    renderWifiStatusMatrix(true);
+    lastMode = WIFI_MATRIX_MODE_BLINK;
+    return;
+  }
+
+  if (now - lastWifiMatrixBlinkMs >= WIFI_MATRIX_BLINK_INTERVAL_MS) {
+    wifiMatrixBlinkVisible = !wifiMatrixBlinkVisible;
+    lastWifiMatrixBlinkMs = now;
+    renderWifiStatusMatrix(wifiMatrixBlinkVisible);
+  }
 }
 
 // Unified mapping function: select continuous or gear mode based on setting
@@ -1031,14 +1123,15 @@ void configureWifiForNetwork(int index) {
   if (!wifiNetworks[index].use_dhcp) {
     Serial.print("  Using static IP: ");
     Serial.println(wifiNetworks[index].local_ip);
+    // WiFiS3 uses config(local_ip, dns_server, gateway, subnet).
+    // Reuse the router IP as DNS so local static-IP links still get a valid gateway.
     WiFi.config(wifiNetworks[index].local_ip,
+                wifiNetworks[index].gateway,
                 wifiNetworks[index].gateway,
                 wifiNetworks[index].subnet);
   } else {
     Serial.println("  Using DHCP");
-    WiFi.config(IPAddress(0, 0, 0, 0),
-                IPAddress(0, 0, 0, 0),
-                IPAddress(0, 0, 0, 0));
+    WiFi.config(IPAddress(0, 0, 0, 0));
   }
 }
 
@@ -1059,13 +1152,29 @@ void printWifiConnectedInfo(int index) {
   Serial.println(" dBm");
 }
 
-void ensureUdpServersStarted() {
+void ensureUdpServersStarted(unsigned long now) {
   if (udpServersStarted || WiFi.status() != WL_CONNECTED) {
     return;
   }
 
-  udp.begin(UDP_PORT);
-  udpHeartbeat.begin(HEARTBEAT_PORT);
+  if (wifiConnectedAtMs == 0) {
+    wifiConnectedAtMs = now;
+  }
+  if (now - wifiConnectedAtMs < WIFI_UDP_START_DELAY_MS) {
+    return;
+  }
+
+  uint8_t dataOk = udp.begin(UDP_PORT);
+  uint8_t heartbeatOk = udpHeartbeat.begin(HEARTBEAT_PORT);
+  if (!dataOk || !heartbeatOk) {
+    udpServersStarted = false;
+    Serial.print("UDP start pending: data=");
+    Serial.print((int)dataOk);
+    Serial.print(" heartbeat=");
+    Serial.println((int)heartbeatOk);
+    return;
+  }
+
   udpServersStarted = true;
 
   Serial.print("Data UDP server started on port ");
@@ -1145,6 +1254,9 @@ void beginWifiReconnectCycle(unsigned long now, bool immediate) {
   wifiAttemptStartMs = 0;
 
   Serial.println("\n=== WiFi Background Connect ===");
+  wifiMatrixBlinkVisible = true;
+  lastWifiMatrixBlinkMs = now;
+  renderWifiStatusMatrix(true);
   if (immediate) {
     startNextWifiAttempt(now);
   }
@@ -1187,6 +1299,10 @@ void checkWiFiStatus() {
       currentNetworkIndex = wifiAttemptNetworkIndex;
     }
 
+    if (wifiConnectedAtMs == 0) {
+      wifiConnectedAtMs = now;
+    }
+
     if (lastWifiDisconnectMs > 0 || !udpServersStarted) {
       printWifiConnectedInfo(currentNetworkIndex);
       if (lastWifiDisconnectMs > 0 && hadPreviousWifiSession) {
@@ -1198,11 +1314,12 @@ void checkWiFiStatus() {
     reconnectAttemptCount = 0;
     reconnectInProgress = false;
     resetWifiAttemptState();
-    ensureUdpServersStarted();
+    ensureUdpServersStarted(now);
     return;
   }
 
   udpServersStarted = false;
+  wifiConnectedAtMs = 0;
 
   if (lastWifiDisconnectMs == 0) {
     lastWifiDisconnectMs = now;
@@ -1281,6 +1398,14 @@ void setup() {
   pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
   lastFlowState = digitalRead(FLOW_SENSOR_PIN);
   Serial.println("Flow meter sensor configured on D7");
+
+  ledMatrixInitialized = ledMatrix.begin();
+  if (ledMatrixInitialized) {
+    renderWifiStatusMatrix(false);
+    Serial.println("LED Matrix WiFi indicator initialized");
+  } else {
+    Serial.println("LED Matrix init FAILED");
+  }
 
   // Initialize DHT sensors
   if (ENABLE_DHT_SENSORS) {
@@ -1363,6 +1488,9 @@ void loop() {
   // 9.5. Dedicated PWM debug stream for investigating twitching
   printPwmEventDebug();
   printPwmDebug(now);
+
+  // 9.6. LED Matrix WiFi status indicator
+  updateWifiStatusMatrix(now);
 
   // 10. Send status to Jetson (may block!)
   sendUdpStatus();
