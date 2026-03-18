@@ -87,9 +87,11 @@ const unsigned long WIFI_RECONNECT_DELAY_MS = 5000; // Wait 5s before reconnect 
 const int MAX_RECONNECT_ATTEMPTS = 3;               // Max full background scan cycles before pausing
 const unsigned long WIFI_CONNECT_ATTEMPT_TIMEOUT_MS = 10000; // Per-network connection timeout
 const unsigned long WIFI_UDP_START_DELAY_MS = 300;  // Let the network stack settle briefly before binding UDP sockets
+const unsigned long UDP_START_RETRY_INTERVAL_MS = 1000; // Avoid tight begin()/stop() churn if sockets are not ready yet
 unsigned long lastWifiCheckMs = 0;
 unsigned long lastWifiDisconnectMs = 0;
 unsigned long wifiConnectedAtMs = 0;
+unsigned long lastUdpStartAttemptMs = 0;
 int reconnectAttemptCount = 0;
 bool reconnectInProgress = false;
 bool wifiAttemptActive = false;
@@ -98,6 +100,7 @@ int wifiAttemptNetworkIndex = -1;
 int wifiCycleStartIndex = -1;
 int wifiNetworksTriedThisCycle = 0;
 bool udpServersStarted = false;
+bool cachedWifiConnected = false;
 
 // UDP Configuration
 const unsigned int UDP_PORT = 8888;         // Data port (commands, status, flow)
@@ -154,6 +157,7 @@ const unsigned long WIFI_GRACE_MS = 400;             // Hold-last grace after ti
 const int DECAY_STEP_US = 5;                         // Soft decay step toward 1500
 const unsigned long STATUS_SEND_INTERVAL_MS = 100;   // Status update rate (10Hz)
 const unsigned long MONITOR_SEND_INTERVAL_MS = 1000;  // Monitor port update rate (1Hz)
+const unsigned long MONITOR_PACKET_INTERVAL_MS = (MONITOR_SEND_INTERVAL_MS + 2) / 3; // Stagger S/F/D across loops at ~1 Hz each
 
 // === WiFi LED Matrix Indicator ===
 const unsigned long WIFI_MATRIX_BLINK_INTERVAL_MS = 120;
@@ -266,6 +270,22 @@ int wifiOutL = ESC_MID;
 int wifiOutR = ESC_MID;
 bool haveWifiCmd = false;
 
+enum MonitorPacketType : byte {
+  MONITOR_PACKET_STATUS = 0,
+  MONITOR_PACKET_FLOW = 1,
+  MONITOR_PACKET_DHT = 2,
+  MONITOR_PACKET_COUNT = 3
+};
+
+enum UdpSendTask : byte {
+  UDP_SEND_TASK_HEARTBEAT = 0,
+  UDP_SEND_TASK_STATUS = 1,
+  UDP_SEND_TASK_FLOW = 2,
+  UDP_SEND_TASK_DHT = 3,
+  UDP_SEND_TASK_MONITOR = 4,
+  UDP_SEND_TASK_COUNT = 5
+};
+
 // WiFi command buffer
 #define CMD_BUFFER_SIZE 64
 static char cmdBuffer[CMD_BUFFER_SIZE];
@@ -286,7 +306,7 @@ int currentMode = 0;  // 0=RC, 1=WiFi
 
 // Status sending
 unsigned long lastStatusSendMs = 0;
-unsigned long lastMonitorSendMs = 0 - MONITOR_SEND_INTERVAL_MS;  // Allow immediate first send
+unsigned long lastMonitorSendMs = 0 - MONITOR_PACKET_INTERVAL_MS;  // Allow immediate first send
 
 // === Flow Meter State ===
 unsigned long lastFlowCalcMs = 0;     // Last time flow data was calculated
@@ -307,6 +327,8 @@ float dht2Temperature = 0.0f;    // Celsius (sensor 2, D13)
 float dht2Humidity = 0.0f;       // Percentage (sensor 2, D13)
 unsigned long lastDhtReadMs = 0 - DHT_READ_INTERVAL_MS;  // Allow immediate first read
 unsigned long lastDhtSendMs = 0 - DHT_SEND_INTERVAL_MS;  // Allow immediate first send
+byte nextMonitorPacketType = 0;
+byte nextUdpSendTask = 0;
 
 // === Helper Functions ===
 
@@ -539,7 +561,7 @@ void renderWifiStatusMatrix(bool lit) {
   }
 }
 
-void updateWifiStatusMatrix(unsigned long now) {
+void updateWifiStatusMatrix(unsigned long now, bool wifiConnected) {
   if (!ledMatrixInitialized) {
     return;
   }
@@ -551,7 +573,6 @@ void updateWifiStatusMatrix(unsigned long now) {
   };
   static int lastMode = WIFI_MATRIX_MODE_OFF;
 
-  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
   bool shouldBlink = !wifiConnected &&
                      countConfiguredWifiNetworks() > 0 &&
                      (wifiAttemptActive || reconnectInProgress || lastWifiDisconnectMs > 0);
@@ -728,37 +749,52 @@ void readDhtSensor(unsigned long now) {
 
 // === UDP Functions ===
 
+void markUdpTransportFailure(const char* context) {
+  Serial.print("UDP transport failed: ");
+  Serial.println(context);
+  stopUdpServers();
+  lastUdpStartAttemptMs = 0;
+}
+
+bool sendUdpPacket(WiFiUDP& socket, const IPAddress& ip, uint16_t port, const char* payload, const char* context) {
+  size_t payloadLen = strlen(payload);
+  if (!socket.beginPacket(ip, port)) {
+    markUdpTransportFailure(context);
+    return false;
+  }
+  if (socket.write((const uint8_t*)payload, payloadLen) != payloadLen) {
+    markUdpTransportFailure(context);
+    return false;
+  }
+  if (!socket.endPacket()) {
+    markUdpTransportFailure(context);
+    return false;
+  }
+  return true;
+}
+
 // Send heartbeat to Jetson (fixed address, unicast)
-void sendHeartbeat() {
-  unsigned long now = millis();
+bool sendHeartbeat(unsigned long now, bool wifiConnected) {
   if (now - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) {
-    return;
+    return false;
+  }
+  if (!udpServersStarted || !wifiConnected) {
+    return false;
   }
 
-  // Only send if WiFi is connected (non-blocking check)
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-  lastHeartbeatMs = now;
-
-  // Broadcast heartbeat so Jetson can detect Arduino without sending first
-  if (ENABLE_HEARTBEAT_BROADCAST) {
-    udpHeartbeat.beginPacket(HEARTBEAT_BROADCAST_IP, HEARTBEAT_PORT);
-    udpHeartbeat.print("HEARTBEAT\n");
-    udpHeartbeat.endPacket();
+  if (ENABLE_HEARTBEAT_BROADCAST &&
+      !sendUdpPacket(udpHeartbeat, HEARTBEAT_BROADCAST_IP, HEARTBEAT_PORT, "HEARTBEAT\n", "heartbeat broadcast")) {
+    return false;
   }
 
   // Send unicast heartbeats only when Jetson is online to avoid blocking
-  if (isJetsonOnline(now)) {
-    udpHeartbeat.beginPacket(JETSON_IP, JETSON_HEARTBEAT_PORT);
-    udpHeartbeat.print("HEARTBEAT\n");
-    udpHeartbeat.endPacket();
-
-    // Optional: Monitor heartbeat (disabled)
-    // udpHeartbeat.beginPacket(JETSON_IP, MONITOR_HEARTBEAT_PORT);
-    // udpHeartbeat.print("HEARTBEAT\n");
-    // udpHeartbeat.endPacket();
+  if (isJetsonOnline(now) &&
+      !sendUdpPacket(udpHeartbeat, JETSON_IP, JETSON_HEARTBEAT_PORT, "HEARTBEAT\n", "heartbeat unicast")) {
+    return false;
   }
+
+  lastHeartbeatMs = now;
+  return true;
 }
 
 // Read UDP commands from Jetson (data port 8888)
@@ -885,22 +921,16 @@ void readHeartbeatPing() {
 }
 
 // Send status via UDP to fixed Jetson address
-void sendUdpStatus() {
-  unsigned long now = millis();
+bool sendUdpStatus(unsigned long now, bool wifiConnected) {
   if (now - lastStatusSendMs < STATUS_SEND_INTERVAL_MS) {
-    return;
+    return false;
   }
-
-  // Only send if WiFi is connected (non-blocking check)
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
+  if (!udpServersStarted || !wifiConnected) {
+    return false;
   }
-  // Avoid blocking sends when Jetson is offline
   if (!isJetsonOnline(now)) {
-    return;
+    return false;
   }
-
-  lastStatusSendMs = now;
 
   // Send status: "S <mode> <left_us> <right_us>\n"
   char statusBuf[50];
@@ -908,30 +938,25 @@ void sendUdpStatus() {
            currentMode, currentLeftUs, currentRightUs);
 
   // Send to Jetson data port (28888) - 10 Hz
-  udp.beginPacket(JETSON_IP, JETSON_PORT);
-  udp.print(statusBuf);
-  udp.endPacket();
+  if (!sendUdpPacket(udp, JETSON_IP, JETSON_PORT, statusBuf, "status")) {
+    return false;
+  }
 
-  // Monitor port sent in sendToMonitorPort()
+  lastStatusSendMs = now;
+  return true;
 }
 
 // Send flow data via UDP to fixed Jetson address
-void sendUdpFlowData() {
-  unsigned long now = millis();
+bool sendUdpFlowData(unsigned long now, bool wifiConnected) {
   if (now - lastFlowSendMs < FLOW_SEND_INTERVAL_MS) {
-    return;
+    return false;
   }
-
-  // Only send if WiFi is connected (non-blocking check)
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
+  if (!udpServersStarted || !wifiConnected) {
+    return false;
   }
-  // Avoid blocking sends when Jetson is offline
   if (!isJetsonOnline(now)) {
-    return;
+    return false;
   }
-
-  lastFlowSendMs = now;
 
   // Send flow data: "F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n"
   char flowBuf[64];
@@ -939,31 +964,28 @@ void sendUdpFlowData() {
            flowFreqHz, flowLmin, flowVelocity, totalLiters);
 
   // Send to Jetson data port (28888) - 5 Hz
-  udp.beginPacket(JETSON_IP, JETSON_PORT);
-  udp.print(flowBuf);
-  udp.endPacket();
+  if (!sendUdpPacket(udp, JETSON_IP, JETSON_PORT, flowBuf, "flow")) {
+    return false;
+  }
 
-  // Monitor port sent in sendToMonitorPort()
+  lastFlowSendMs = now;
+  return true;
 }
 
 // Send DHT data via UDP to Jetson
-void sendUdpDhtData() {
+bool sendUdpDhtData(unsigned long now, bool wifiConnected) {
   if (!ENABLE_DHT_SENSORS) {
-    return;
+    return false;
   }
-  unsigned long now = millis();
   if (now - lastDhtSendMs < DHT_SEND_INTERVAL_MS) {
-    return;
+    return false;
   }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
+  if (!udpServersStarted || !wifiConnected) {
+    return false;
   }
   if (!isJetsonOnline(now)) {
-    return;
+    return false;
   }
-
-  lastDhtSendMs = now;
 
   // Send DHT data: "D <temp1> <hum1> <temp2> <hum2>\n"
   char dhtBuf[48];
@@ -971,52 +993,90 @@ void sendUdpDhtData() {
            dht1Temperature, dht1Humidity, dht2Temperature, dht2Humidity);
 
   // Send to Jetson data port (28888) - 1 Hz
-  udp.beginPacket(JETSON_IP, JETSON_PORT);
-  udp.print(dhtBuf);
-  udp.endPacket();
+  if (!sendUdpPacket(udp, JETSON_IP, JETSON_PORT, dhtBuf, "dht")) {
+    return false;
+  }
 
-  // DHT sent to monitor port in sendToMonitorPort()
+  lastDhtSendMs = now;
+  return true;
 }
 
-// Send all data to monitor port (28889) at 1 Hz
-void sendToMonitorPort() {
-  unsigned long now = millis();
-  if (now - lastMonitorSendMs < MONITOR_SEND_INTERVAL_MS) {
-    return;
+// Send monitor packets one-at-a-time so a single loop never bursts three UDP sends back-to-back.
+bool sendToMonitorPort(unsigned long now, bool wifiConnected) {
+  if (now - lastMonitorSendMs < MONITOR_PACKET_INTERVAL_MS) {
+    return false;
   }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
+  if (!udpServersStarted || !wifiConnected) {
+    return false;
   }
   if (!isJetsonOnline(now)) {
-    return;
+    return false;
+  }
+
+  char packetBuf[64];
+  const char* context = "monitor";
+
+  switch (nextMonitorPacketType) {
+    case MONITOR_PACKET_STATUS:
+      snprintf(packetBuf, sizeof(packetBuf), "S %d %d %d\n",
+               currentMode, currentLeftUs, currentRightUs);
+      context = "monitor status";
+      break;
+    case MONITOR_PACKET_FLOW:
+      snprintf(packetBuf, sizeof(packetBuf), "F %.2f %.2f %.4f %.3f\n",
+               flowFreqHz, flowLmin, flowVelocity, totalLiters);
+      context = "monitor flow";
+      break;
+    case MONITOR_PACKET_DHT:
+    default:
+      snprintf(packetBuf, sizeof(packetBuf), "D %.2f %.2f %.2f %.2f\n",
+               dht1Temperature, dht1Humidity, dht2Temperature, dht2Humidity);
+      context = "monitor dht";
+      break;
+  }
+
+  if (!sendUdpPacket(udp, JETSON_IP, MONITOR_HEARTBEAT_PORT, packetBuf, context)) {
+    return false;
   }
 
   lastMonitorSendMs = now;
+  nextMonitorPacketType = (nextMonitorPacketType + 1) % MONITOR_PACKET_COUNT;
+  return true;
+}
 
-  // Send status
-  char statusBuf[50];
-  snprintf(statusBuf, sizeof(statusBuf), "S %d %d %d\n",
-           currentMode, currentLeftUs, currentRightUs);
-  udp.beginPacket(JETSON_IP, MONITOR_HEARTBEAT_PORT);
-  udp.print(statusBuf);
-  udp.endPacket();
+void serviceOneUdpSendTask(unsigned long now, bool wifiConnected) {
+  for (byte offset = 0; offset < UDP_SEND_TASK_COUNT; ++offset) {
+    byte task = (nextUdpSendTask + offset) % UDP_SEND_TASK_COUNT;
+    bool sent = false;
 
-  // Send flow data
-  char flowBuf[64];
-  snprintf(flowBuf, sizeof(flowBuf), "F %.2f %.2f %.4f %.3f\n",
-           flowFreqHz, flowLmin, flowVelocity, totalLiters);
-  udp.beginPacket(JETSON_IP, MONITOR_HEARTBEAT_PORT);
-  udp.print(flowBuf);
-  udp.endPacket();
+    switch (task) {
+      case UDP_SEND_TASK_HEARTBEAT:
+        sent = sendHeartbeat(now, wifiConnected);
+        break;
+      case UDP_SEND_TASK_STATUS:
+        sent = sendUdpStatus(now, wifiConnected);
+        break;
+      case UDP_SEND_TASK_FLOW:
+        sent = sendUdpFlowData(now, wifiConnected);
+        break;
+      case UDP_SEND_TASK_DHT:
+        sent = sendUdpDhtData(now, wifiConnected);
+        break;
+      case UDP_SEND_TASK_MONITOR:
+        sent = sendToMonitorPort(now, wifiConnected);
+        break;
+      default:
+        break;
+    }
 
-  // Send DHT data
-  char dhtBuf[48];
-  snprintf(dhtBuf, sizeof(dhtBuf), "D %.2f %.2f %.2f %.2f\n",
-           dht1Temperature, dht1Humidity, dht2Temperature, dht2Humidity);
-  udp.beginPacket(JETSON_IP, MONITOR_HEARTBEAT_PORT);
-  udp.print(dhtBuf);
-  udp.endPacket();
+    if (sent) {
+      nextUdpSendTask = (task + 1) % UDP_SEND_TASK_COUNT;
+      return;
+    }
+    if (!udpServersStarted) {
+      return;
+    }
+  }
 }
 
 void determineControlMode() {
@@ -1152,8 +1212,14 @@ void printWifiConnectedInfo(int index) {
   Serial.println(" dBm");
 }
 
-void ensureUdpServersStarted(unsigned long now) {
-  if (udpServersStarted || WiFi.status() != WL_CONNECTED) {
+void stopUdpServers() {
+  udp.stop();
+  udpHeartbeat.stop();
+  udpServersStarted = false;
+}
+
+void ensureUdpServersStarted(unsigned long now, bool wifiConnected) {
+  if (udpServersStarted || !wifiConnected) {
     return;
   }
 
@@ -1163,12 +1229,21 @@ void ensureUdpServersStarted(unsigned long now) {
   if (now - wifiConnectedAtMs < WIFI_UDP_START_DELAY_MS) {
     return;
   }
+  if (lastUdpStartAttemptMs != 0 && now - lastUdpStartAttemptMs < UDP_START_RETRY_INTERVAL_MS) {
+    return;
+  }
+
+  lastUdpStartAttemptMs = now;
+
+  // WiFiS3 latches a socket handle after begin(); if one port succeeds and the
+  // other fails, we must stop both before retrying or begin() will keep returning 0.
+  stopUdpServers();
 
   uint8_t dataOk = udp.begin(UDP_PORT);
   uint8_t heartbeatOk = udpHeartbeat.begin(HEARTBEAT_PORT);
   if (!dataOk || !heartbeatOk) {
-    udpServersStarted = false;
-    Serial.print("UDP start pending: data=");
+    stopUdpServers();
+    Serial.print("UDP start failed, retrying: data=");
     Serial.print((int)dataOk);
     Serial.print(" heartbeat=");
     Serial.println((int)heartbeatOk);
@@ -1176,6 +1251,7 @@ void ensureUdpServersStarted(unsigned long now) {
   }
 
   udpServersStarted = true;
+  lastUdpStartAttemptMs = 0;
 
   Serial.print("Data UDP server started on port ");
   Serial.println(UDP_PORT);
@@ -1283,15 +1359,16 @@ void finishWifiReconnectCycle(unsigned long now) {
 }
 
 // Check WiFi status and advance the non-blocking background connection state
-void checkWiFiStatus() {
+bool checkWiFiStatus() {
   unsigned long now = millis();
 
   if (now - lastWifiCheckMs < WIFI_CHECK_INTERVAL_MS) {
-    return;
+    return cachedWifiConnected;
   }
   lastWifiCheckMs = now;
 
   bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+  cachedWifiConnected = wifiConnected;
 
   if (wifiConnected) {
     bool hadPreviousWifiSession = currentNetworkIndex >= 0;
@@ -1314,12 +1391,13 @@ void checkWiFiStatus() {
     reconnectAttemptCount = 0;
     reconnectInProgress = false;
     resetWifiAttemptState();
-    ensureUdpServersStarted(now);
-    return;
+    ensureUdpServersStarted(now, wifiConnected);
+    return true;
   }
 
-  udpServersStarted = false;
+  stopUdpServers();
   wifiConnectedAtMs = 0;
+  lastUdpStartAttemptMs = 0;
 
   if (lastWifiDisconnectMs == 0) {
     lastWifiDisconnectMs = now;
@@ -1339,12 +1417,12 @@ void checkWiFiStatus() {
         finishWifiReconnectCycle(now);
       }
     }
-    return;
+    return false;
   }
 
   if (!reconnectInProgress) {
     if (now - lastWifiDisconnectMs < WIFI_RECONNECT_DELAY_MS) {
-      return;
+      return false;
     }
     beginWifiReconnectCycle(now, false);
   }
@@ -1352,6 +1430,7 @@ void checkWiFiStatus() {
   if (!startNextWifiAttempt(now)) {
     finishWifiReconnectCycle(now);
   }
+  return false;
 }
 
 // === Setup ===
@@ -1459,7 +1538,7 @@ void loop() {
   readRcInputs();
 
   // 2. Check WiFi status and auto-reconnect in the background
-  checkWiFiStatus();
+  bool wifiConnected = checkWiFiStatus();
 
   // 3. Poll again after WiFi check (may have missed pulses)
   pollFlowSensor();
@@ -1473,49 +1552,33 @@ void loop() {
   // 5. Poll again after UDP read (critical - UDP can block)
   pollFlowSensor();
 
-  // 6. Send heartbeat (may block!)
-  sendHeartbeat();
-
-  // 7. Poll again after heartbeat
-  pollFlowSensor();
-
-  // 8. Determine control mode and outputs (fast)
+  // 6. Determine control mode and outputs (fast)
   determineControlMode();
 
-  // 9. Update thrusters (fast)
+  // 7. Update thrusters (fast)
   updateThrusters();
 
-  // 9.5. Dedicated PWM debug stream for investigating twitching
+  // 7.5. Dedicated PWM debug stream for investigating twitching
   printPwmEventDebug();
   printPwmDebug(now);
 
-  // 9.6. LED Matrix WiFi status indicator
-  updateWifiStatusMatrix(now);
+  // 7.6. LED Matrix WiFi status indicator
+  updateWifiStatusMatrix(now, wifiConnected);
 
-  // 10. Send status to Jetson (may block!)
-  sendUdpStatus();
-
-  // 11. Poll again after status send
-  pollFlowSensor();
-
-  // 12. Send flow data to Jetson (may block!)
-  sendUdpFlowData();
-
-  // 12.5. Read and send DHT data
+  // 8. Refresh DHT cache before any optional telemetry send
   readDhtSensor(now);
-  sendUdpDhtData();
 
-  // 12.6. Send all data to monitor port (28889) at 1 Hz
-  sendToMonitorPort();
+  // 9. Allow at most one outbound UDP task per loop, after control outputs are updated
+  serviceOneUdpSendTask(now, wifiConnected);
 
-  // 13. Final poll before loop restart
+  // 10. Final poll before loop restart
   pollFlowSensor();
 
-  // 14. Calculate flow data (do this once per loop)
+  // 11. Calculate flow data (do this once per loop)
   calculateFlowData(now);
 
-  // 15. Connection state transitions (fast)
-  bool wifiLink = (WiFi.status() == WL_CONNECTED);
+  // 12. Connection state transitions (fast)
+  bool wifiLink = wifiConnected;
   static bool prevWifiLink = false;
   static bool stateInit = false;
   if (!stateInit) {
