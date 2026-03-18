@@ -5,6 +5,36 @@ All notable changes to the thruster and speed control project will be documented
 ## [Unreleased]
 
 ### Added
+- **PWM Debug Output** - Added dedicated `[PWM]` and `[PWM EVT]` serial diagnostics for RC/WiFi/final ESC outputs, including raw RC pulse widths, freshness, latch state, and final commanded microseconds.
+- **LED Matrix WiFi Indicator** - Added onboard UNO R4 WiFi LED matrix status indication:
+  - Blinks while WiFi is connecting or reconnecting
+  - Stays lit when WiFi link is connected
+- **UDP Socket Startup Guard** - Added delayed UDP socket startup after WiFi link-up, with retry logging when `udp.begin()` or `udpHeartbeat.begin()` is not ready yet.
+
+### Changed
+- **ESC Output Path** - Replaced `Servo`-based ESC output with UNO R4 hardware `PwmOut` to avoid pulse corruption when DHT reads temporarily disable interrupts.
+- **Boot Behavior** - ESC outputs are now initialized to neutral immediately on boot, then held at neutral for 2000 ms before WiFi connection starts.
+- **WiFi Connection Flow** - Reworked WiFi startup/reconnect logic to avoid the old all-networks blocking scan in `setup()`:
+  - Connection attempts now progress network-by-network with explicit state tracking
+  - UDP sockets are started only after WiFi is confirmed up
+  - RC input is read before WiFi maintenance in the main loop
+- **WiFi Status UX** - Replaced the previous external buzzer notification idea with onboard LED matrix link indication.
+- **Static IP Configuration** - Corrected `WiFiS3::config(...)` usage to match the UNO R4 core signature `config(local_ip, dns_server, gateway, subnet)`.
+- **Serial Documentation in Code** - Startup and reconnect serial output now reflects the current WiFi/UDP lifecycle more accurately.
+
+### Fixed
+- **DHT-Induced Thruster Twitching** - Fixed random ESC/thruster twitching caused by interrupt-sensitive `Servo` timing interacting with DHT reads.
+- **RC False-Alive Detection** - RC signal validity now depends on recently captured valid PWM pulses instead of stale pulse width values lingering forever.
+- **RC Input Floating Noise** - RC inputs were hardened so invalid short noise pulses are rejected rather than treated as fresh control input.
+- **WiFi/Jetson Communication Regression** - Fixed static-IP gateway configuration that caused invalid network settings such as `Gateway: 255.255.255.0`.
+- **UDP Bring-Up After WiFi Connect** - Fixed a race where WiFi could report connected before UDP sockets were successfully bound, preventing Jetson communication even on the correct network.
+
+### Known Limitations
+- **WiFiS3 Blocking Connect** - The current UNO R4 `WiFiS3` core still blocks inside `WiFi.begin()` during each connection attempt, so a failed SSID can stall boot or reconnect for roughly 10 seconds before the next network is tried.
+- **Jetson Handshake Requirement** - Arduino does not start unicast `S/F/D` traffic until Jetson first sends `PING` or a `C ...` command.
+- **UDP Reliability Model** - Transport remains plain UDP without ACK/retry/sequence tracking, so delivery is best-effort rather than guaranteed.
+
+### Added
 - **Heartbeat Broadcast on 8889** — Arduino now broadcasts `HEARTBEAT` on port 8889 for passive discovery.
 - **Jetson PING on 8889** — Jetson sends `PING` on port 8889 to mark itself online.
 
