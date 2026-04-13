@@ -19,7 +19,7 @@
 // Serial output format:
 //   dt[ms]=..., state=..., edges[count]=..., glitches[count]=...,
 //   freq[Hz]=..., flow[L/min]=..., velocity_26mm_raw[m/s]=...,
-//   velocity_ts_cal[m/s]=..., total[L]=..., last_edge[ms]=...
+//   velocity_scaled[m/s]=..., total[L]=..., last_edge[ms]=...
 //
 // Field meanings:
 //   dt_ms
@@ -55,9 +55,9 @@
 //       v = Q / A
 //     This is the geometric conversion before any pool calibration.
 //
-//   velocity_ts_cal
-//     Velocity after applying the swimming-pool calibration factor derived from
-//     the total station mean speed, treated as ground truth.
+//   velocity_scaled
+//     Velocity after applying the requested sensor speed scaling factor:
+//       SENSOR_SPEED_SCALE = (26 / 14)^2 / 0.76
 //
 //   total_liters
 //     Cumulative passed volume since boot using the datasheet pulse count:
@@ -82,15 +82,10 @@ const float PIPE_AREA_M2 = 3.1415926f * (PIPE_DIAMETER_M * 0.5f) * (PIPE_DIAMETE
 // this factor without changing the nominal sensor constants above.
 const float FLOW_CALIBRATION_SCALE = 1.0f;
 
-// Swimming-pool calibration using total station as ground truth.
-// This factor is relative to the raw 26 mm full-pipe velocity used in this
-// sketch, not to the already-scaled sensor series inside velocity_analysis.py.
-// Derived from:
-//   total_station mean speed = 0.5904929809950917 m/s
-//   raw 26 mm equivalent sensor mean speed -> total factor = 7.649039733989088
-// Mean speed is used instead of peak speed because UDP/WiFi transport delay can
-// shift peaks in time, while the interval mean is much less delay-sensitive.
-const float VELOCITY_CALIBRATION_SCALE_TS = 7.6490397f;
+// Sensor speed scaling requested by the pool analysis workflow:
+//   SENSOR_SPEED_SCALE = (26 / 14)^2 / 0.76
+// This multiplier is applied on top of the raw 26 mm full-pipe velocity.
+const float SENSOR_SPEED_SCALE = ((26.0f / 14.0f) * (26.0f / 14.0f)) / 0.76f;
 
 unsigned long acceptedEdges = 0;
 unsigned long rejectedGlitches = 0;
@@ -116,8 +111,8 @@ void setup() {
   Serial.println();
   Serial.println("YF-S403 flow meter on D7");
   Serial.println("Using datasheet calibration: f = 5 * Q, 1L ~= 300 pulses");
-  Serial.println("Velocity output includes raw 26 mm conversion and total-station-calibrated speed.");
-  Serial.println("dt[ms]=..., state=..., edges[count]=..., glitches[count]=..., freq[Hz]=..., flow[L/min]=..., velocity_26mm_raw[m/s]=..., velocity_ts_cal[m/s]=..., total[L]=..., last_edge[ms]=...");
+  Serial.println("Velocity output includes raw 26 mm conversion and SENSOR_SPEED_SCALE-adjusted speed.");
+  Serial.println("dt[ms]=..., state=..., edges[count]=..., glitches[count]=..., freq[Hz]=..., flow[L/min]=..., velocity_26mm_raw[m/s]=..., velocity_scaled[m/s]=..., total[L]=..., last_edge[ms]=...");
 }
 
 void loop() {
@@ -168,8 +163,8 @@ void loop() {
   float flowM3s = (flowLmin * 0.001f) / 60.0f;
   float velocity26mmRaw = (PIPE_AREA_M2 > 0.0f) ? (flowM3s / PIPE_AREA_M2) : 0.0f;
 
-  // Then apply the total-station-based calibration factor.
-  float velocityTsCal = velocity26mmRaw * VELOCITY_CALIBRATION_SCALE_TS;
+  // Then apply the requested sensor speed scale.
+  float velocityScaled = velocity26mmRaw * SENSOR_SPEED_SCALE;
 
   // If this value keeps growing, it means no new valid pulse has arrived.
   unsigned long ageMs = (lastAcceptedEdgeUs == 0) ? 0UL : (micros() - lastAcceptedEdgeUs) / 1000UL;
@@ -188,8 +183,8 @@ void loop() {
   Serial.print(flowLmin, 2);
   Serial.print(", velocity_26mm_raw[m/s]=");
   Serial.print(velocity26mmRaw, 4);
-  Serial.print(", velocity_ts_cal[m/s]=");
-  Serial.print(velocityTsCal, 4);
+  Serial.print(", velocity_scaled[m/s]=");
+  Serial.print(velocityScaled, 4);
   Serial.print(", total[L]=");
   Serial.print(totalLiters, 3);
   Serial.print(", last_edge[ms]=");
