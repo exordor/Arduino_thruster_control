@@ -44,7 +44,8 @@ def main():
     parser.add_argument("--lease-only", action="store_true")
     args = parser.parse_args()
 
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="mqtt-test-helper")
+    client_id = f"mqtt-test-helper-{time.time_ns()}"
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
     client.on_connect = on_connect
     client.on_message = on_message
     client.connect(args.host, args.port, 60)

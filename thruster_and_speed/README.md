@@ -1,11 +1,11 @@
 # Thruster & Flow Meter Control (Arduino UNO R4 WiFi)
 
-A dual thruster control system with integrated flow meter and DHT22 temperature/humidity sensors for Arduino UNO R4 WiFi. The firmware supports two transport modes: dual-port UDP for direct socket control and MQTT for broker-based control/telemetry.
+A dual thruster control system with integrated flow meter and DHT22 temperature/humidity sensors for Arduino UNO R4 WiFi. The firmware is transport-selectable: dual-port UDP for direct socket control or MQTT for broker-based control/telemetry.
 
 ## Features
 
 - **Dual Thruster Control**: Two ESC outputs for differential thrust
-- **RC Fallback**: Automatic switch to RC receiver when UDP timeout
+- **RC Fallback**: Automatic switch to RC receiver when UDP mode times out
 - **Flow Meter**: Real-time flow rate and volume measurement
 - **DHT22 Sensors**: Dual temperature and humidity monitoring (D12, D13)
 - **Transport-Selectable**: Build as UDP or MQTT from the same sketch tree
@@ -77,8 +77,8 @@ arduino-cli compile --fqbn arduino:renesas_uno:unor4wifi \
 | Pipe diameter | 26 mm |
 | Calibration factor (K) | 5 Hz per L/min |
 | Pulses per liter | 300 |
-| Flow update rate | 1 Hz |
-| **DHT22 update rate** | **1 Hz (read every 2.5s)** |
+| Flow update rate | 5 Hz |
+| **DHT22 update rate** | **30 s** |
 | Status update rate | 10 Hz |
 | Heartbeat interval | 1000 ms |
 | UDP timeout | 2000 ms |
@@ -153,7 +153,7 @@ python3 -m pip install paho-mqtt
 python3 /Users/jlw/Documents/Arduino/thruster_and_speed/mqtt_test.py --publish --left 1600 --right 1600
 ```
 
-### Message Protocol
+### UDP Message Protocol
 
 #### Data Port (8888)
 
@@ -162,7 +162,7 @@ python3 /Users/jlw/Documents/Arduino/thruster_and_speed/mqtt_test.py --publish -
 | Client → Arduino | `C <left_us> <right_us>\n` | Thruster command | **20ms min** |
 | Arduino → Client | `S <mode> <left_us> <right_us>\n` | Thruster status (to 28888, 28889) | 10 Hz |
 | Arduino → Client | `F <freq_hz> <flow_lmin> <velocity_ms> <total_liters>\n` | Flow data (to 28888, 28889) | 5 Hz |
-| Arduino → Client | `D <temp1> <hum1> <temp2> <hum2>\n` | DHT data (to 28888, 28889) | 1 Hz |
+| Arduino → Client | `D <temp1> <hum1> <temp2> <hum2>\n` | DHT data (to 28888, 28889) | 30 s |
 
 > **Note**: All data messages (S, F, D) are sent to both port 28888 (Jetson data) and 28889 (Monitor).
 
@@ -241,10 +241,10 @@ Continuous operation:
 
 ### Current Implementation Notes
 
-- ESC outputs are held at neutral for 2 seconds on boot before WiFi connection starts.
+- ESC outputs are held at neutral for 2 seconds on boot before the transport stack starts.
 - The LED matrix blinks while WiFi is connecting or reconnecting, and stays lit when WiFi is connected.
-- UDP sockets are started only after WiFi is up and the link has been stable for about 300 ms.
-- Broadcast `HEARTBEAT` packets can appear as soon as WiFi is up, but unicast `S/F/D` packets are sent only after Jetson is marked online by `PING` or `C ...`.
+- UDP sockets are started only after WiFi is up and the link has been stable for about 300 ms; MQTT mode waits for broker connectivity instead.
+- Broadcast `HEARTBEAT` packets can appear as soon as WiFi is up in UDP mode, but unicast `S/F/D` packets are sent only after Jetson is marked online by `PING` or `C ...`.
 - The current UNO R4 `WiFiS3` core uses a blocking `WiFi.begin()` internally, so each failed SSID can still stall boot or reconnect for roughly 10 seconds before the next network is tried.
 
 ### Why Separate Ports?
@@ -260,7 +260,7 @@ Continuous operation:
 
 The system uses different filtering parameters for optimal performance with each input type:
 
-| Characteristic | RC (Joystick) | WiFi (UDP) |
+| Characteristic | RC (Joystick) | WiFi transport (UDP/MQTT) |
 |----------------|---------------|-----------|
 | Filter Alpha | 25% (smooth) | 100% (direct) |
 | Max Step | 15µs/cycle | 500µs/cycle |
@@ -276,14 +276,14 @@ The system uses different filtering parameters for optimal performance with each
 | Metric | RC | WiFi |
 |--------|-------|------|
 | Response Time | ~200-300ms (smooth ramp) | ~40-80ms (fast) |
-| Max Command Rate | Limited by human | 50 Hz (20ms min) |
+| Max Command Rate | Limited by human | 50 Hz (20ms min, UDP mode) |
 | Drift Resistance | High (±40µs deadband) | N/A (digital) |
 | Precision | Medium (joystick dependent) | High (exact values) |
 
 ## Control Priority
 
-1. **WiFi/UDP commands** (if receiving data)
-2. **RC receiver** (if UDP timeout)
+1. **WiFi transport commands** (`UDP` packets or `MQTT` broker messages, if receiving data)
+2. **RC receiver** (if UDP mode times out or WiFi transport is unavailable)
 3. **Neutral failsafe** (if both unavailable)
 
 ## RC Control Mode
@@ -320,12 +320,12 @@ Edit the `wifiNetworks[]` array in the code to add your networks.
 - The bundled profiles reuse the router IP as both DNS server and gateway.
 - If Jetson is not fixed at `192.168.50.200`, update `JETSON_IP` in the sketch or communication will fail even if WiFi is connected.
 
-## Serial Output
+## Serial Output (UDP Mode Example)
 
 Connect via USB at 115200 baud for debugging:
 
 ```
-=== WiFi UDP + RC Thruster Control + Flow Meter + DHT22 ===
+=== WiFi Transport + RC Thruster Control + Flow Meter + DHT22 ===
 RC Control Mode: Gear Mode (9 gears, 100µs intervals)
 
 RC input pins configured
@@ -352,16 +352,16 @@ Heartbeat server started on port 8889
 Ready for UDP control commands
 
 === System Ready ===
-Control Priority: UDP > RC > Failsafe
-Flow Meter: D7 polling mode, 1 Hz update rate
-DHT22: D12 and D13, 1 Hz update rate
-UDP: Listen 8888, Send S/F/D to 192.168.50.200:28888
+Control Priority: UDP mode > RC > Failsafe
+Flow Meter: D7 polling mode, 5 Hz update rate
+DHT22: D12 and D13, 30 s update rate
+UDP mode: Listen 8888, Send S/F/D to 192.168.50.200:28888
      S/F/D also sent to 192.168.50.200:28889 (monitor)
      HEARTBEAT broadcast to 192.168.50.255:8889
      HEARTBEAT unicast to 192.168.50.200:28887 (Jetson)
 ```
 
-## Python Client Example
+## UDP Python Client Example
 
 ### Basic Client (Dual Port)
 
@@ -405,7 +405,7 @@ while True:
             print(f"[DHT] {msg}")
 ```
 
-### Using the Test Script
+### Using the UDP Test Script
 
 A comprehensive test script is included:
 
@@ -457,7 +457,7 @@ python3 udp_test.py --ip 192.168.50.100
 2. **Initial Handshake**: Send `PING` immediately after connection on port 8889
 3. **Keep-Alive**: Send `PING` every 1 second on port 8889 to maintain connection
 4. **Use `select()`**: Monitor both sockets simultaneously for incoming data
-5. **Handle Rate Limiting**: WiFi commands have 20ms minimum interval, PING does not
+5. **Handle Rate Limiting**: WiFi transport commands have a 20ms minimum interval in UDP mode, PING does not
 
 ### C++ ROS Node Structure
 
@@ -521,39 +521,41 @@ const int DEADBAND_US = 40;            // Deadband around center (20-100µs)
 
 ### "Jetson: OFFLINE" in Serial Monitor
 
-- Check client is sending data to port 8888
-- Verify heartbeat is being received on port 8889
-- Send PING to port 8889 to mark Jetson online
+- In UDP mode, check client is sending data to port 8888
+- In UDP mode, verify heartbeat is being received on port 8889
+- In UDP mode, send PING to port 8889 to mark Jetson online
+- In MQTT mode, verify the broker is reachable and `arduino/system/online` is retained as `online`
 - Verify IP address configuration matches
 
 ### No status/flow after PING
 
-- Ensure Jetson is sending PING to port 8889
-- Check data port (8888) is correct
-- Verify firewall is not blocking UDP
+- In UDP mode, ensure Jetson is sending PING to port 8889
+- In UDP mode, check data port (8888) is correct
+- In UDP mode, verify firewall is not blocking UDP
 
 ### WiFi connected but no `S/F/D` data
 
-- Confirm Jetson sends `PING\n` to port 8889 immediately after link-up
-- `HEARTBEAT` broadcast alone does not mark Jetson online on the Arduino side
-- Check Jetson IP really is `192.168.50.200` or update `JETSON_IP` in the sketch
-- Wait for `Data UDP server started on port 8888` in Serial before expecting traffic
+- In UDP mode, confirm Jetson sends `PING\n` to port 8889 immediately after link-up
+- In UDP mode, `HEARTBEAT` broadcast alone does not mark Jetson online on the Arduino side
+- In UDP mode, check Jetson IP really is `192.168.50.200` or update `JETSON_IP` in the sketch
+- In UDP mode, wait for `Data UDP server started on port 8888` in Serial before expecting traffic
+- In MQTT mode, confirm the broker connection is up and the `arduino/thruster/status` and `arduino/system/online` topics are being published
 
 ### No heartbeat on port 8889
 
-- Verify heartbeat port (8889) is correct
-- Check client is bound to port 8889
-- Confirm broadcast traffic is allowed on the WiFi network
+- In UDP mode, verify heartbeat port (8889) is correct
+- In UDP mode, check client is bound to port 8889
+- In UDP mode, confirm broadcast traffic is allowed on the WiFi network
 
 ### Slow startup / delayed reconnect
 
-- The current UNO R4 `WiFiS3` core blocks inside `WiFi.begin()` during each connection attempt
+- In both modes, the current UNO R4 `WiFiS3` core blocks inside `WiFi.begin()` during each connection attempt
 - A failed SSID can therefore delay boot or reconnect by roughly 10 seconds before the next network is tried
 - This is a current implementation limitation, not just a serial logging delay
 
 ### Command rate limiting
 
-- WiFi commands have **20ms minimum interval** (max 50 Hz)
+- WiFi commands have **20ms minimum interval** in UDP mode (max 50 Hz)
 - PING is NOT rate limited (can be sent anytime)
 - Use keep-alive mode to maintain connection
 - RC control has **separate filtering** (25% alpha, smooth) to resist joystick drift
@@ -562,7 +564,7 @@ const int DEADBAND_US = 40;            // Deadband around center (20-100µs)
 
 - Verify flow sensor connected to D7
 - Check sensor power supply
-- Increase `FLOW_UPDATE_INTERVAL_MS` for testing
+- Increase `FLOW_SEND_INTERVAL_MS` for testing
 
 ### RC control not working
 
@@ -575,7 +577,7 @@ const int DEADBAND_US = 40;            // Deadband around center (20-100µs)
 - Verify DHT22 sensors connected to D12 and D13
 - Check sensor power supply (3.3V or 5V)
 - Add 10kΩ pull-up resistor between DATA and VCC if not built into module
-- DHT22 requires 2+ seconds between reads (reading too fast returns NaN)
+- DHT22 reads are throttled to 30 s in the current sketch, so allow time before expecting a fresh update
 - Check DHT library is installed in Arduino IDE
 
 ## License
