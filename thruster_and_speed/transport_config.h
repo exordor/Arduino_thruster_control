@@ -26,6 +26,7 @@ constexpr char MQTT_TOPIC_SYSTEM_ONLINE[] = "arduino/system/online";
 
 constexpr size_t MQTT_RX_BUFFER_SIZE = 256;
 constexpr size_t MQTT_TX_BUFFER_SIZE = 256;
+constexpr unsigned long MQTT_CONNECT_TIMEOUT_MS = 250;
 constexpr unsigned long MQTT_RECONNECT_INTERVAL_MS = 2000;
 
 #if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_MQTT
