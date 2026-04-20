@@ -15,16 +15,33 @@ bool connectMqttBroker() {
   mqttClient.setId(MQTT_CLIENT_ID);
   mqttClient.setConnectionTimeout(MQTT_CONNECT_TIMEOUT_MS);
   mqttClient.setKeepAliveInterval(15000);
-  return mqttClient.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
+  if (!mqttClient.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT)) {
+    return false;
+  }
+
+  mqttClient.subscribe(MQTT_TOPIC_THRUSTER_CMD);
+  mqttClient.subscribe(MQTT_TOPIC_THRUSTER_LEASE);
+  return true;
 }
 
 bool readMqttPayload(char* buffer, size_t bufferSize) {
   size_t index = 0;
-  while (mqttClient.available() && index + 1 < bufferSize) {
+  bool overflowed = false;
+
+  while (mqttClient.available()) {
+    if (index + 1 >= bufferSize) {
+      overflowed = true;
+      break;
+    }
     buffer[index++] = static_cast<char>(mqttClient.read());
   }
+
+  while (mqttClient.available()) {
+    mqttClient.read();
+  }
+
   buffer[index] = '\0';
-  return index > 0;
+  return index > 0 && !overflowed;
 }
 
 bool parseThrusterCommand(const char* payload, int& leftUs, int& rightUs) {
