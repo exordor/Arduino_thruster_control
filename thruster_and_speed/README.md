@@ -1,6 +1,6 @@
 # Thruster & Flow Meter Control (Arduino UNO R4 WiFi)
 
-A dual thruster control system with integrated flow meter and DHT22 temperature/humidity sensors for Arduino UNO R4 WiFi, using dual-port UDP communication for low-latency real-time control.
+A dual thruster control system with integrated flow meter and DHT22 temperature/humidity sensors for Arduino UNO R4 WiFi. The firmware supports two transport modes: dual-port UDP for direct socket control and MQTT for broker-based control/telemetry.
 
 ## Features
 
@@ -8,11 +8,54 @@ A dual thruster control system with integrated flow meter and DHT22 temperature/
 - **RC Fallback**: Automatic switch to RC receiver when UDP timeout
 - **Flow Meter**: Real-time flow rate and volume measurement
 - **DHT22 Sensors**: Dual temperature and humidity monitoring (D12, D13)
+- **Transport-Selectable**: Build as UDP or MQTT from the same sketch tree
 - **Dual-Port UDP**: Data (8888) and heartbeat (8889) separated for reliability
-- **PING Heartbeat (8889)**: Jetson keeps Arduino "online" without touching data port
+- **MQTT Telemetry**: Thruster, flow, DHT, and online state topics for broker-based integration
+- **PING Heartbeat (8889)**: Jetson keeps Arduino "online" without touching data port in UDP mode
 - **Multi-Network WiFi**: Auto-connect to configured networks with reconnection
 - **LED Matrix Status**: Onboard LED matrix blinks while WiFi is connecting and stays lit when connected
 - **Hardware PWM ESC Output**: Uses UNO R4 `PwmOut`, so DHT reads do not distort ESC pulses
+
+## Transport Modes
+
+The transport is selected at compile time with `THRUSTER_TRANSPORT_MODE`.
+
+### UDP Mode
+
+- `THRUSTER_TRANSPORT_MODE=0`
+- Uses the existing dual-port UDP protocol
+- Best for direct Jetson-to-Arduino communication with the lowest overhead
+
+### MQTT Mode
+
+- `THRUSTER_TRANSPORT_MODE=1`
+- Uses `ArduinoMqttClient` plus `ArduinoJson`
+- Publishes telemetry and online state through the broker while subscribing to thruster command and lease topics
+
+### Build Commands
+
+Install the extra Arduino libraries used by MQTT mode:
+
+```bash
+arduino-cli lib install "ArduinoMqttClient"
+arduino-cli lib install "ArduinoJson"
+```
+
+Build UDP mode:
+
+```bash
+arduino-cli compile --fqbn arduino:renesas_uno:unor4wifi \
+  --build-property compiler.cpp.extra_flags="-DTHRUSTER_TRANSPORT_MODE=0" \
+  /Users/jlw/Documents/Arduino/thruster_and_speed
+```
+
+Build MQTT mode:
+
+```bash
+arduino-cli compile --fqbn arduino:renesas_uno:unor4wifi \
+  --build-property compiler.cpp.extra_flags="-DTHRUSTER_TRANSPORT_MODE=1" \
+  /Users/jlw/Documents/Arduino/thruster_and_speed
+```
 
 ## Hardware
 
@@ -60,6 +103,8 @@ Left ESC            →  D10
 
 ## UDP Communication (Dual Port)
 
+This section applies when the firmware is built with `THRUSTER_TRANSPORT_MODE=0`.
+
 ### Architecture
 
 The system uses two separate UDP ports for cleaner protocol separation:
@@ -78,6 +123,35 @@ The system uses two separate UDP ports for cleaner protocol separation:
 - **Heartbeat Broadcast**: 192.168.50.255:8889 (always when WiFi connected)
 - **Jetson Unicast Heartbeat**: 192.168.50.200:28887 (only after PING)
 - **Important**: Arduino does not start unicast `S/F/D` traffic until Jetson first sends `PING` or a `C ...` command
+
+## MQTT Communication
+
+This section applies when the firmware is built with `THRUSTER_TRANSPORT_MODE=1`.
+
+### Topics
+
+- `arduino/thruster/cmd`
+- `arduino/thruster/lease`
+- `arduino/thruster/status`
+- `arduino/flow/status`
+- `arduino/dht/status`
+- `arduino/system/online`
+
+### MQTT Behavior
+
+- The Arduino subscribes to `arduino/thruster/cmd` and `arduino/thruster/lease`
+- Thruster commands are expected as JSON payloads with `left_us` and `right_us`
+- Telemetry is published on the status, flow, dht, and system online topics
+- `arduino/system/online` uses retained online/offline state so clients can detect broker presence quickly
+
+### Bench Test Helper
+
+Install the Python client and run the helper to publish test commands:
+
+```bash
+python3 -m pip install paho-mqtt
+python3 /Users/jlw/Documents/Arduino/thruster_and_speed/mqtt_test.py --publish --left 1600 --right 1600
+```
 
 ### Message Protocol
 
@@ -141,9 +215,11 @@ HEARTBEAT\n
 
 ## Connection Detection & Handshake
 
-### Dual-Port Heartbeat System
+### UDP Mode Handshake
 
-```
+The dual-port heartbeat system works like this:
+
+```text
 Client startup:
 1. Bind to local port for data (ephemeral) → Arduino:8888
 2. Bind to local port 8889 for heartbeat (rx + tx)
@@ -156,6 +232,12 @@ Continuous operation:
 - Receive broadcast HEARTBEAT on 8889
 - If 2s without PING at Arduino → Arduino switches to RC and stops unicast data
 ```
+
+### MQTT Mode Handshake
+
+- MQTT mode uses broker connectivity instead of UDP heartbeat packets
+- `arduino/system/online` is retained so the client can observe online/offline transitions
+- `arduino/thruster/lease` can be used as a lightweight manual keep-alive during bench testing
 
 ### Current Implementation Notes
 
