@@ -465,6 +465,26 @@ int snapEscToNeutral(int pulseUs) {
   return constrain(pulseUs, ESC_MIN, ESC_MAX);
 }
 
+void applyTransportCommand(int leftUs, int rightUs, unsigned long now) {
+  int rawL = constrain(leftUs, ESC_MIN, ESC_MAX);
+  int rawR = constrain(rightUs, ESC_MIN, ESC_MAX);
+
+  int filtL = (wifiAvgL * (100 - WIFI_FILTER_ALPHA) + rawL * WIFI_FILTER_ALPHA) / 100;
+  int filtR = (wifiAvgR * (100 - WIFI_FILTER_ALPHA) + rawR * WIFI_FILTER_ALPHA) / 100;
+
+  int deltaL = constrain(filtL - wifiAvgL, -WIFI_MAX_STEP_US, WIFI_MAX_STEP_US);
+  int deltaR = constrain(filtR - wifiAvgR, -WIFI_MAX_STEP_US, WIFI_MAX_STEP_US);
+
+  wifiAvgL += deltaL;
+  wifiAvgR += deltaR;
+  wifiOutL = wifiAvgL;
+  wifiOutR = wifiAvgR;
+
+  lastTransportCmdMs = now;
+  lastControllerLeaseMs = now;
+  haveTransportCmd = true;
+}
+
 void printPwmDebug(unsigned long now) {
   if (!PWM_DEBUG_ENABLED) {
     return;
@@ -867,32 +887,8 @@ void readUdpCommands() {
         } else {
           int leftUs = 0, rightUs = 0;
           if (sscanf(cmdBuffer, "C %d %d", &leftUs, &rightUs) == 2) {
-            // Constrain and store raw WiFi commands
-            int rawL = constrain(leftUs, ESC_MIN, ESC_MAX);
-            int rawR = constrain(rightUs, ESC_MIN, ESC_MAX);
-
-            // Apply low-pass filter to WiFi inputs (WiFi uses low-latency filtering)
-            int filtL = (wifiAvgL * (100 - WIFI_FILTER_ALPHA) + rawL * WIFI_FILTER_ALPHA) / 100;
-            int filtR = (wifiAvgR * (100 - WIFI_FILTER_ALPHA) + rawR * WIFI_FILTER_ALPHA) / 100;
-
-            // Apply soft-start ramp limiting (WiFi uses faster ramp for responsive control)
-            int deltaL = filtL - wifiAvgL;
-            if (deltaL > WIFI_MAX_STEP_US) deltaL = WIFI_MAX_STEP_US;
-            if (deltaL < -WIFI_MAX_STEP_US) deltaL = -WIFI_MAX_STEP_US;
-            wifiAvgL += deltaL;
-
-            int deltaR = filtR - wifiAvgR;
-            if (deltaR > WIFI_MAX_STEP_US) deltaR = WIFI_MAX_STEP_US;
-            if (deltaR < -WIFI_MAX_STEP_US) deltaR = -WIFI_MAX_STEP_US;
-            wifiAvgR += deltaR;
-
-            // Smoothed WiFi outputs
-            wifiOutL = wifiAvgL;
-            wifiOutR = wifiAvgR;
-            lastTransportCmdMs = millis();
+            applyTransportCommand(leftUs, rightUs, now);
             lastWifiCommandSentMs = now;
-            haveTransportCmd = true;
-            lastControllerLeaseMs = now;
 
             // Debug: Show received command (rate limited to prevent flooding)
             static unsigned long lastUdpDebugMs = 0;
@@ -1126,6 +1122,18 @@ void serviceOneUdpSendTask(unsigned long now, bool wifiConnected) {
 
 void determineControlMode() {
   unsigned long now = millis();
+
+  if (!isTransportConnected()) {
+    currentMode = 0;
+    currentLeftUs = rcOutL;
+    currentRightUs = rcOutR;
+    wifiAvgL = currentLeftUs;
+    wifiAvgR = currentRightUs;
+    wifiOutL = wifiAvgL;
+    wifiOutR = wifiAvgR;
+    haveTransportCmd = false;
+    return;
+  }
 
   bool controllerOnline = isControllerOnline(now);
   if (!controllerOnline) {
