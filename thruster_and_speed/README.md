@@ -29,7 +29,7 @@ The transport is selected at compile time with `THRUSTER_TRANSPORT_MODE`.
 ### MQTT Mode
 
 - `THRUSTER_TRANSPORT_MODE=1`
-- Uses `ArduinoMqttClient` plus `ArduinoJson`
+- Uses `PubSubClient` plus `ArduinoJson`
 - Publishes telemetry and online state through the broker while subscribing to thruster command and lease topics
 
 ### Build Commands
@@ -37,7 +37,7 @@ The transport is selected at compile time with `THRUSTER_TRANSPORT_MODE`.
 Install the extra Arduino libraries used by MQTT mode:
 
 ```bash
-arduino-cli lib install "ArduinoMqttClient"
+arduino-cli lib install "PubSubClient"
 arduino-cli lib install "ArduinoJson"
 ```
 

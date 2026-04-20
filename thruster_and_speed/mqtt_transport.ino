@@ -2,14 +2,15 @@
 
 #if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_MQTT
 #include <WiFiS3.h>
-#include <ArduinoMqttClient.h>
+#include <PubSubClient.h>
 #include <ArduinoJson.h>
 
 WiFiClient mqttWifiClient;
-MqttClient mqttClient(mqttWifiClient);
+PubSubClient mqttClient(mqttWifiClient);
 unsigned long lastMqttReconnectAttemptMs = 0;
 bool mqttOnlineStateDirty = false;
 byte nextMqttTelemetryTask = 0;
+unsigned long mqttCallbackNow = 0;
 
 enum MqttTelemetryTask : byte {
   MQTT_TELEMETRY_TASK_STATUS = 0,
@@ -19,26 +20,51 @@ enum MqttTelemetryTask : byte {
 
 void applyTransportCommand(int leftUs, int rightUs, unsigned long now);
 
+void mqttMessageCallback(char* topic, uint8_t* payload, unsigned int length) {
+  char payloadBuf[MQTT_RX_BUFFER_SIZE];
+  if (length == 0 || length >= MQTT_RX_BUFFER_SIZE) {
+    return;
+  }
+  memcpy(payloadBuf, payload, length);
+  payloadBuf[length] = '\0';
+
+  unsigned long now = mqttCallbackNow;
+
+  if (strcmp(topic, MQTT_TOPIC_THRUSTER_CMD) == 0) {
+    int leftUs = ESC_MID;
+    int rightUs = ESC_MID;
+    if (parseThrusterCommand(payloadBuf, leftUs, rightUs)) {
+      if (now - lastWifiCommandSentMs >= MIN_CMD_INTERVAL_MS) {
+        applyTransportCommand(leftUs, rightUs, now);
+        lastWifiCommandSentMs = now;
+      }
+    }
+  } else if (strcmp(topic, MQTT_TOPIC_THRUSTER_LEASE) == 0) {
+    if (parseLeaseMessage(payloadBuf)) {
+      lastControllerLeaseMs = now;
+    }
+  }
+}
+
 bool connectMqttBroker() {
   static const char offlinePayload[] = "{\"state\":\"offline\"}";
+  static bool callbackSet = false;
 
-  mqttClient.setId(MQTT_CLIENT_ID);
-  mqttClient.setConnectionTimeout(MQTT_CONNECT_TIMEOUT_MS);
-  mqttClient.setKeepAliveInterval(15000);
-  mqttClient.beginWill(MQTT_TOPIC_SYSTEM_ONLINE,
-                       strlen(offlinePayload),
-                       true,
-                       0);
-  mqttClient.print(offlinePayload);
-  mqttClient.endWill();
+  mqttClient.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
 
-  if (!mqttClient.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT)) {
+  if (!callbackSet) {
+    mqttClient.setCallback(mqttMessageCallback);
+    callbackSet = true;
+  }
+
+  if (!mqttClient.connect(MQTT_CLIENT_ID,
+                          MQTT_TOPIC_SYSTEM_ONLINE, 0, true, offlinePayload)) {
     return false;
   }
 
   if (!mqttClient.subscribe(MQTT_TOPIC_THRUSTER_CMD) ||
       !mqttClient.subscribe(MQTT_TOPIC_THRUSTER_LEASE)) {
-    mqttClient.stop();
+    mqttClient.disconnect();
     return false;
   }
   return true;
@@ -53,9 +79,7 @@ bool publishJsonTopic(const char* topic, bool retain, const char* jsonPayload, s
     return false;
   }
 
-  mqttClient.beginMessage(topic, payloadSize, retain, 0, false);
-  mqttClient.print(jsonPayload);
-  return mqttClient.endMessage();
+  return mqttClient.publish(topic, jsonPayload, retain);
 }
 
 bool publishOnlineState() {
@@ -148,26 +172,6 @@ bool publishDhtStatusMqtt(unsigned long now) {
   return true;
 }
 
-bool readMqttPayload(char* buffer, size_t bufferSize) {
-  size_t index = 0;
-  bool overflowed = false;
-
-  while (mqttClient.available()) {
-    if (index + 1 >= bufferSize) {
-      overflowed = true;
-      break;
-    }
-    buffer[index++] = static_cast<char>(mqttClient.read());
-  }
-
-  while (mqttClient.available()) {
-    mqttClient.read();
-  }
-
-  buffer[index] = '\0';
-  return index > 0 && !overflowed;
-}
-
 bool parseThrusterCommand(const char* payload, int& leftUs, int& rightUs) {
   StaticJsonDocument<192> doc;
   DeserializationError error = deserializeJson(doc, payload);
@@ -224,33 +228,8 @@ void ensureMqttConnected(unsigned long now, bool wifiConnected) {
 void pollMqttTransport(unsigned long now, bool wifiConnected) {
   ensureMqttConnected(now, wifiConnected);
   if (mqttClient.connected()) {
-    mqttClient.poll();
-
-    int messageSize = mqttClient.parseMessage();
-    if (!messageSize) {
-      return;
-    }
-
-    char payload[MQTT_RX_BUFFER_SIZE];
-    if (!readMqttPayload(payload, sizeof(payload))) {
-      return;
-    }
-
-    String topic = mqttClient.messageTopic();
-    if (topic == MQTT_TOPIC_THRUSTER_CMD) {
-      int leftUs = ESC_MID;
-      int rightUs = ESC_MID;
-      if (parseThrusterCommand(payload, leftUs, rightUs)) {
-        if (now - lastWifiCommandSentMs >= MIN_CMD_INTERVAL_MS) {
-          applyTransportCommand(leftUs, rightUs, now);
-          lastWifiCommandSentMs = now;
-        }
-      }
-    } else if (topic == MQTT_TOPIC_THRUSTER_LEASE) {
-      if (parseLeaseMessage(payload)) {
-        lastControllerLeaseMs = now;
-      }
-    }
+    mqttCallbackNow = now;
+    mqttClient.loop();
   }
 }
 #endif
