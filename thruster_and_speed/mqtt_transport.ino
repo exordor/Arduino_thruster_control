@@ -36,8 +36,11 @@ bool connectMqttBroker() {
     return false;
   }
 
-  mqttClient.subscribe(MQTT_TOPIC_THRUSTER_CMD);
-  mqttClient.subscribe(MQTT_TOPIC_THRUSTER_LEASE);
+  if (!mqttClient.subscribe(MQTT_TOPIC_THRUSTER_CMD) ||
+      !mqttClient.subscribe(MQTT_TOPIC_THRUSTER_LEASE)) {
+    mqttClient.stop();
+    return false;
+  }
   return true;
 }
 
@@ -238,7 +241,10 @@ void pollMqttTransport(unsigned long now, bool wifiConnected) {
       int leftUs = ESC_MID;
       int rightUs = ESC_MID;
       if (parseThrusterCommand(payload, leftUs, rightUs)) {
-        applyTransportCommand(leftUs, rightUs, now);
+        if (now - lastWifiCommandSentMs >= MIN_CMD_INTERVAL_MS) {
+          applyTransportCommand(leftUs, rightUs, now);
+          lastWifiCommandSentMs = now;
+        }
       }
     } else if (topic == MQTT_TOPIC_THRUSTER_LEASE) {
       if (parseLeaseMessage(payload)) {

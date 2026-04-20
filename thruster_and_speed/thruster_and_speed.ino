@@ -1433,7 +1433,12 @@ bool checkWiFiStatus() {
       wifiConnectedAtMs = now;
     }
 
-    if (lastWifiDisconnectMs > 0 || !udpServersStarted) {
+#if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_UDP
+    bool shouldReportWifiConnected = (lastWifiDisconnectMs > 0 || !udpServersStarted);
+#else
+    bool shouldReportWifiConnected = (lastWifiDisconnectMs > 0);
+#endif
+    if (shouldReportWifiConnected) {
       printWifiConnectedInfo(currentNetworkIndex);
       if (lastWifiDisconnectMs > 0 && hadPreviousWifiSession) {
         Serial.println("WiFi link restored");
@@ -1444,11 +1449,15 @@ bool checkWiFiStatus() {
     reconnectAttemptCount = 0;
     reconnectInProgress = false;
     resetWifiAttemptState();
+#if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_UDP
     ensureUdpServersStarted(now, wifiConnected);
+#endif
     return true;
   }
 
+#if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_UDP
   stopUdpServers();
+#endif
   wifiConnectedAtMs = 0;
   lastUdpStartAttemptMs = 0;
 
@@ -1508,7 +1517,13 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  Serial.println("\n=== WiFi UDP + RC Thruster Control + Flow Meter + DHT22 ===");
+  Serial.println(
+#if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_UDP
+      "\n=== WiFi UDP + RC Thruster Control + Flow Meter + DHT22 ==="
+#else
+      "\n=== WiFi MQTT + RC Thruster Control + Flow Meter + DHT22 ==="
+#endif
+  );
   Serial.print("RC Control Mode: ");
   Serial.println(ENABLE_GEAR_MODE ? "Gear Mode (9 gears, 100µs intervals)" : "Continuous Mode");
   Serial.print("ESC Output: ");
@@ -1566,17 +1581,29 @@ void setup() {
   }
 
   Serial.println("\n=== System Ready ===");
-  Serial.println("Control Priority: UDP > RC > Failsafe");
+  Serial.println(
+#if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_UDP
+      "Control Priority: UDP > RC > Failsafe"
+#else
+      "Control Priority: MQTT > RC > Failsafe"
+#endif
+  );
   Serial.println("Flow Meter: D7 polling mode, 200 ms updates with 1 s rolling window");
   if (ENABLE_DHT_SENSORS) {
     Serial.println("DHT22: D12 and D13, 30 s update rate");
   } else {
     Serial.println("DHT22: DISABLED");
   }
+#if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_UDP
   Serial.println("UDP: Listen 8888, Send S/F/D to 192.168.50.200:28888");
   Serial.println("     S/F/D also sent to 192.168.50.200:28889 (monitor)");
   Serial.println("     HEARTBEAT broadcast to 192.168.50.255:8889");
   Serial.println("     HEARTBEAT unicast to 192.168.50.200:28887 (Jetson)");
+#else
+  Serial.println("MQTT: Broker 192.168.50.200:1883");
+  Serial.println("      Subscriptions: arduino/thruster/cmd, arduino/thruster/lease");
+  Serial.println("      Telemetry: arduino/thruster/status, arduino/flow/status, arduino/dht/status");
+#endif
   Serial.println();
 }
 
