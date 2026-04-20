@@ -350,10 +350,6 @@ byte nextUdpSendTask = 0;
 
 // === Helper Functions ===
 
-bool isTransportConnected() {
-  return udpServersStarted && cachedWifiConnected;
-}
-
 bool initEscPwmOutputs() {
   bool leftOk = escL.begin(ESC_PWM_PERIOD_US, ESC_MID);
   bool rightOk = escR.begin(ESC_PWM_PERIOD_US, ESC_MID);

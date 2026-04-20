@@ -5,6 +5,10 @@ bool isControllerOnline(unsigned long now) {
          (now - lastControllerLeaseMs < JETSON_ONLINE_TIMEOUT_MS);
 }
 
+bool isTransportConnected() {
+  return udpServersStarted && cachedWifiConnected;
+}
+
 void pollTransportInput(unsigned long now, bool wifiConnected) {
 #if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_UDP
   if (!udpServersStarted || !wifiConnected) {
