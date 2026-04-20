@@ -8,6 +8,14 @@
 WiFiClient mqttWifiClient;
 MqttClient mqttClient(mqttWifiClient);
 unsigned long lastMqttReconnectAttemptMs = 0;
+bool mqttOnlineStateDirty = false;
+byte nextMqttTelemetryTask = 0;
+
+enum MqttTelemetryTask : byte {
+  MQTT_TELEMETRY_TASK_STATUS = 0,
+  MQTT_TELEMETRY_TASK_DHT = 1,
+  MQTT_TELEMETRY_TASK_COUNT = 2
+};
 
 void applyTransportCommand(int leftUs, int rightUs, unsigned long now);
 
@@ -53,6 +61,19 @@ bool publishOnlineState() {
   char payload[MQTT_TX_BUFFER_SIZE];
   size_t payloadSize = serializeJson(doc, payload, sizeof(payload));
   return publishJsonTopic(MQTT_TOPIC_SYSTEM_ONLINE, true, payload, payloadSize);
+}
+
+bool servicePendingOnlineState() {
+  if (!mqttOnlineStateDirty || !mqttClient.connected()) {
+    return false;
+  }
+
+  if (publishOnlineState()) {
+    mqttOnlineStateDirty = false;
+    nextMqttTelemetryTask = MQTT_TELEMETRY_TASK_STATUS;
+  }
+
+  return true;
 }
 
 bool publishThrusterStatusMqtt(unsigned long now, bool wifiConnected) {
@@ -177,9 +198,6 @@ bool isTransportConnected() {
 
 void ensureMqttConnected(unsigned long now, bool wifiConnected) {
   if (!wifiConnected) {
-    if (mqttClient.connected()) {
-      mqttClient.stop();
-    }
     return;
   }
 
@@ -194,8 +212,9 @@ void ensureMqttConnected(unsigned long now, bool wifiConnected) {
 
   lastMqttReconnectAttemptMs = now;
   if (connectMqttBroker()) {
+    mqttOnlineStateDirty = true;
     lastMqttReconnectAttemptMs = 0;
-    publishOnlineState();
+    servicePendingOnlineState();
   }
 }
 

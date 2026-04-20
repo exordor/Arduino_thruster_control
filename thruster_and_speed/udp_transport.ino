@@ -31,14 +31,35 @@ void serviceOneTransportSendTask(unsigned long now, bool wifiConnected) {
     return;
   }
 
+  if (servicePendingOnlineState()) {
+    return;
+  }
+
+  // Flow stays first because it is the most timing-sensitive telemetry.
   if (publishFlowStatusMqtt(now)) {
+    nextMqttTelemetryTask = MQTT_TELEMETRY_TASK_STATUS;
     return;
   }
-  if (publishThrusterStatusMqtt(now, wifiConnected)) {
-    return;
-  }
-  if (publishDhtStatusMqtt(now)) {
-    return;
+
+  for (byte offset = 0; offset < MQTT_TELEMETRY_TASK_COUNT; ++offset) {
+    byte task = (nextMqttTelemetryTask + offset) % MQTT_TELEMETRY_TASK_COUNT;
+    bool sent = false;
+
+    switch (task) {
+      case MQTT_TELEMETRY_TASK_STATUS:
+        sent = publishThrusterStatusMqtt(now, wifiConnected);
+        break;
+      case MQTT_TELEMETRY_TASK_DHT:
+        sent = publishDhtStatusMqtt(now);
+        break;
+      default:
+        break;
+    }
+
+    if (sent) {
+      nextMqttTelemetryTask = (task + 1) % MQTT_TELEMETRY_TASK_COUNT;
+      return;
+    }
   }
 #endif
 }
