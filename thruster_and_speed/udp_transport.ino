@@ -27,7 +27,18 @@ void serviceOneTransportSendTask(unsigned long now, bool wifiConnected) {
 #if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_UDP
   serviceOneUdpSendTask(now, wifiConnected);
 #else
-  (void)now;
-  (void)wifiConnected;
+  if (!mqttClient.connected()) {
+    return;
+  }
+
+  if (publishFlowStatusMqtt(now)) {
+    return;
+  }
+  if (publishThrusterStatusMqtt(now, wifiConnected)) {
+    return;
+  }
+  if (publishDhtStatusMqtt(now)) {
+    return;
+  }
 #endif
 }

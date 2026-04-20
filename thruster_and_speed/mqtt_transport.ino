@@ -12,15 +12,115 @@ unsigned long lastMqttReconnectAttemptMs = 0;
 void applyTransportCommand(int leftUs, int rightUs, unsigned long now);
 
 bool connectMqttBroker() {
+  static const char offlinePayload[] = "{\"state\":\"offline\"}";
+
   mqttClient.setId(MQTT_CLIENT_ID);
   mqttClient.setConnectionTimeout(MQTT_CONNECT_TIMEOUT_MS);
   mqttClient.setKeepAliveInterval(15000);
+  mqttClient.beginWill(MQTT_TOPIC_SYSTEM_ONLINE,
+                       strlen(offlinePayload),
+                       true,
+                       0);
+  mqttClient.print(offlinePayload);
+  mqttClient.endWill();
+
   if (!mqttClient.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT)) {
     return false;
   }
 
   mqttClient.subscribe(MQTT_TOPIC_THRUSTER_CMD);
   mqttClient.subscribe(MQTT_TOPIC_THRUSTER_LEASE);
+  return true;
+}
+
+bool publishJsonTopic(const char* topic, bool retain, const char* jsonPayload, size_t payloadSize) {
+  if (payloadSize == 0) {
+    return false;
+  }
+
+  if (payloadSize >= MQTT_TX_BUFFER_SIZE) {
+    return false;
+  }
+
+  mqttClient.beginMessage(topic, payloadSize, retain, 0, false);
+  mqttClient.print(jsonPayload);
+  return mqttClient.endMessage();
+}
+
+bool publishOnlineState() {
+  StaticJsonDocument<64> doc;
+  doc["state"] = "online";
+  char payload[MQTT_TX_BUFFER_SIZE];
+  size_t payloadSize = serializeJson(doc, payload, sizeof(payload));
+  return publishJsonTopic(MQTT_TOPIC_SYSTEM_ONLINE, true, payload, payloadSize);
+}
+
+bool publishThrusterStatusMqtt(unsigned long now, bool wifiConnected) {
+  if (now - lastStatusSendMs < STATUS_SEND_INTERVAL_MS || !mqttClient.connected()) {
+    return false;
+  }
+
+  StaticJsonDocument<192> doc;
+  doc["mode"] = currentMode == 1 ? "mqtt" : "rc";
+  doc["left_us"] = currentLeftUs;
+  doc["right_us"] = currentRightUs;
+  doc["cmd_age_ms"] = haveTransportCmd ? now - lastTransportCmdMs : 0;
+  doc["controller_online"] = isControllerOnline(now);
+  doc["wifi_connected"] = wifiConnected;
+
+  char payload[MQTT_TX_BUFFER_SIZE];
+  size_t payloadSize = serializeJson(doc, payload, sizeof(payload));
+  if (!publishJsonTopic(MQTT_TOPIC_THRUSTER_STATUS, false, payload, payloadSize)) {
+    return false;
+  }
+
+  lastStatusSendMs = now;
+  return true;
+}
+
+bool publishFlowStatusMqtt(unsigned long now) {
+  if (now - lastFlowSendMs < FLOW_SEND_INTERVAL_MS || !mqttClient.connected()) {
+    return false;
+  }
+
+  StaticJsonDocument<192> doc;
+  doc["freq_hz"] = flowFreqHz;
+  doc["flow_lmin"] = flowLmin;
+  doc["velocity_ms"] = flowVelocity;
+  doc["total_liters"] = totalLiters;
+
+  char payload[MQTT_TX_BUFFER_SIZE];
+  size_t payloadSize = serializeJson(doc, payload, sizeof(payload));
+  if (!publishJsonTopic(MQTT_TOPIC_FLOW_STATUS, false, payload, payloadSize)) {
+    return false;
+  }
+
+  lastFlowSendMs = now;
+  return true;
+}
+
+bool publishDhtStatusMqtt(unsigned long now) {
+  if (!ENABLE_DHT_SENSORS || now - lastDhtSendMs < DHT_SEND_INTERVAL_MS ||
+      !mqttClient.connected()) {
+    return false;
+  }
+
+  StaticJsonDocument<256> doc;
+  JsonObject sensor1 = doc.createNestedObject("sensor_1");
+  sensor1["temp_c"] = dht1Temperature;
+  sensor1["hum_pct"] = dht1Humidity;
+
+  JsonObject sensor2 = doc.createNestedObject("sensor_2");
+  sensor2["temp_c"] = dht2Temperature;
+  sensor2["hum_pct"] = dht2Humidity;
+
+  char payload[MQTT_TX_BUFFER_SIZE];
+  size_t payloadSize = serializeJson(doc, payload, sizeof(payload));
+  if (!publishJsonTopic(MQTT_TOPIC_DHT_STATUS, false, payload, payloadSize)) {
+    return false;
+  }
+
+  lastDhtSendMs = now;
   return true;
 }
 
@@ -93,7 +193,10 @@ void ensureMqttConnected(unsigned long now, bool wifiConnected) {
   }
 
   lastMqttReconnectAttemptMs = now;
-  connectMqttBroker();
+  if (connectMqttBroker()) {
+    lastMqttReconnectAttemptMs = 0;
+    publishOnlineState();
+  }
 }
 
 void pollMqttTransport(unsigned long now, bool wifiConnected) {
