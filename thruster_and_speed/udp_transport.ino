@@ -17,8 +17,7 @@ void pollTransportInput(unsigned long now, bool wifiConnected) {
   readUdpCommands();
   readHeartbeatPing();
 #else
-  (void)now;
-  (void)wifiConnected;
+  pollMqttTransport(now, wifiConnected);
 #endif
 }
 
