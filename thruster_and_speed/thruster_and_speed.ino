@@ -3,6 +3,12 @@
 #include "pwm.h"
 #include <WiFiUdp.h>
 #include "DHT.h"
+#include "transport_config.h"
+
+bool isControllerOnline(unsigned long now);
+bool isTransportConnected();
+void pollTransportInput(unsigned long now, bool wifiConnected);
+void serviceOneTransportSendTask(unsigned long now, bool wifiConnected);
 
 /*
  * Dual Thrusters Control + Flow Meter + DHT22 - WiFi UDP + RC Hybrid Mode
@@ -267,13 +273,13 @@ int rcOutL = ESC_MID;
 int rcOutR = ESC_MID;
 
 // === UDP/WiFi State ===
-unsigned long lastWifiCmdMs = 0;
+unsigned long lastTransportCmdMs = 0;
 unsigned long lastUdpReceiveMs = 0;    // Last time any UDP data received
-unsigned long lastJetsonPingMs = 0;    // Last time Jetson ping/command received
+unsigned long lastControllerLeaseMs = 0;    // Last time controller ping/command received
 unsigned long lastHeartbeatMs = 0;     // Last heartbeat sent
 int wifiOutL = ESC_MID;
 int wifiOutR = ESC_MID;
-bool haveWifiCmd = false;
+bool haveTransportCmd = false;
 
 enum MonitorPacketType : byte {
   MONITOR_PACKET_STATUS = 0,
@@ -344,8 +350,8 @@ byte nextUdpSendTask = 0;
 
 // === Helper Functions ===
 
-inline bool isJetsonOnline(unsigned long now) {
-  return (lastJetsonPingMs > 0) && (now - lastJetsonPingMs < JETSON_ONLINE_TIMEOUT_MS);
+bool isTransportConnected() {
+  return udpServersStarted && cachedWifiConnected;
 }
 
 bool initEscPwmOutputs() {
@@ -821,7 +827,7 @@ bool sendHeartbeat(unsigned long now, bool wifiConnected) {
   }
 
   // Send unicast heartbeats only when Jetson is online to avoid blocking
-  if (isJetsonOnline(now) &&
+  if (isControllerOnline(now) &&
       !sendUdpPacket(udpHeartbeat, JETSON_IP, JETSON_HEARTBEAT_PORT, "HEARTBEAT\n", "heartbeat unicast")) {
     return false;
   }
@@ -887,10 +893,10 @@ void readUdpCommands() {
             // Smoothed WiFi outputs
             wifiOutL = wifiAvgL;
             wifiOutR = wifiAvgR;
-            lastWifiCmdMs = millis();
+            lastTransportCmdMs = millis();
             lastWifiCommandSentMs = now;
-            haveWifiCmd = true;
-            lastJetsonPingMs = now;
+            haveTransportCmd = true;
+            lastControllerLeaseMs = now;
 
             // Debug: Show received command (rate limited to prevent flooding)
             static unsigned long lastUdpDebugMs = 0;
@@ -949,7 +955,7 @@ void readHeartbeatPing() {
   }
 
   if (strcmp(udpBuffer, "PING") == 0 || strcmp(udpBuffer, "P") == 0) {
-    lastJetsonPingMs = millis();
+    lastControllerLeaseMs = millis();
   }
 }
 
@@ -961,7 +967,7 @@ bool sendUdpStatus(unsigned long now, bool wifiConnected) {
   if (!udpServersStarted || !wifiConnected) {
     return false;
   }
-  if (!isJetsonOnline(now)) {
+  if (!isControllerOnline(now)) {
     return false;
   }
 
@@ -987,7 +993,7 @@ bool sendUdpFlowData(unsigned long now, bool wifiConnected) {
   if (!udpServersStarted || !wifiConnected) {
     return false;
   }
-  if (!isJetsonOnline(now)) {
+  if (!isControllerOnline(now)) {
     return false;
   }
 
@@ -1016,7 +1022,7 @@ bool sendUdpDhtData(unsigned long now, bool wifiConnected) {
   if (!udpServersStarted || !wifiConnected) {
     return false;
   }
-  if (!isJetsonOnline(now)) {
+  if (!isControllerOnline(now)) {
     return false;
   }
 
@@ -1042,7 +1048,7 @@ bool sendToMonitorPort(unsigned long now, bool wifiConnected) {
   if (!udpServersStarted || !wifiConnected) {
     return false;
   }
-  if (!isJetsonOnline(now)) {
+  if (!isControllerOnline(now)) {
     return false;
   }
 
@@ -1125,8 +1131,8 @@ void serviceOneUdpSendTask(unsigned long now, bool wifiConnected) {
 void determineControlMode() {
   unsigned long now = millis();
 
-  bool jetsonOnline = isJetsonOnline(now);
-  if (!jetsonOnline) {
+  bool controllerOnline = isControllerOnline(now);
+  if (!controllerOnline) {
     // Jetson offline: immediately favor RC and sync WiFi state to avoid jumps later
     currentMode = 0;
     currentLeftUs = rcOutL;
@@ -1135,21 +1141,21 @@ void determineControlMode() {
     wifiAvgR = currentRightUs;
     wifiOutL = wifiAvgL;
     wifiOutR = wifiAvgR;
-    haveWifiCmd = false;
+    haveTransportCmd = false;
     return;
   }
 
   // Check if WiFi commands are active (recent command received)
-  bool udpActive = haveWifiCmd && (now - lastWifiCmdMs < UDP_TIMEOUT_MS);
+  bool transportActive = haveTransportCmd && (now - lastTransportCmdMs < UDP_TIMEOUT_MS);
 
-  if (udpActive) {
+  if (transportActive) {
     // UDP has priority, preserve smoothing state
     currentMode = 1;
     currentLeftUs = wifiOutL;
     currentRightUs = wifiOutR;
   } else {
     // No recent UDP command — apply grace hold then soft decay
-    unsigned long age = haveWifiCmd ? (now - lastWifiCmdMs) : UDP_TIMEOUT_MS + WIFI_GRACE_MS + 1;
+    unsigned long age = haveTransportCmd ? (now - lastTransportCmdMs) : UDP_TIMEOUT_MS + WIFI_GRACE_MS + 1;
     if (age <= UDP_TIMEOUT_MS + WIFI_GRACE_MS) {
       // Hold last UDP filtered values, decay toward neutral
       currentMode = 1;
@@ -1587,11 +1593,8 @@ void loop() {
   // 3. Poll again after WiFi check (may have missed pulses)
   pollFlowSensor();
 
-  // 4. Read UDP commands and heartbeat only after sockets are ready
-  if (udpServersStarted) {
-    readUdpCommands();
-    readHeartbeatPing();
-  }
+  // 4. Read transport commands and heartbeat only after sockets are ready
+  pollTransportInput(now, wifiConnected);
 
   // 5. Poll again after UDP read (critical - UDP can block)
   pollFlowSensor();
@@ -1613,8 +1616,8 @@ void loop() {
   calculateFlowData(now);
 
   // 9. Allow at most one outbound UDP task per loop, after control outputs are updated.
-  // Flow is prioritized inside serviceOneUdpSendTask() so it is less likely to be delayed.
-  serviceOneUdpSendTask(now, wifiConnected);
+  // Flow is prioritized inside serviceOneTransportSendTask() so it is less likely to be delayed.
+  serviceOneTransportSendTask(now, wifiConnected);
 
   // 10. DHT is low priority and slow-changing, so refresh it after flow/send work.
   readDhtSensor(now);
@@ -1653,7 +1656,7 @@ void loop() {
 
       // WiFi cmd age
       if (currentMode == 1) {
-        unsigned long cmdAge = haveWifiCmd ? (now - lastWifiCmdMs) : 0;
+        unsigned long cmdAge = haveTransportCmd ? (now - lastTransportCmdMs) : 0;
         Serial.print("cmd:");
         Serial.print(cmdAge);
         Serial.print("ms ");
@@ -1694,7 +1697,7 @@ void loop() {
       Serial.print(" R:");
       Serial.print(currentRightUs);
       Serial.print(" | Jetson:");
-      Serial.print(isJetsonOnline(now) ? "ON" : "OFF");
+      Serial.print(isControllerOnline(now) ? "ON" : "OFF");
       Serial.print(" | Monitor sent:");
       Serial.println(now - lastMonitorSendMs < 1100 ? "OK" : "SKIP");
     }
