@@ -88,24 +88,14 @@ WifiNetwork wifiNetworks[MAX_WIFI_NETWORKS] = {
 // Track which network is currently connected
 int currentNetworkIndex = -1;
 
-// WiFi auto-reconnect configuration
-const unsigned long WIFI_CHECK_INTERVAL_MS = 250;   // Background WiFi state machine tick
-const unsigned long WIFI_RECONNECT_DELAY_MS = 5000; // Wait 5s before reconnect attempt
-const int MAX_RECONNECT_ATTEMPTS = 3;               // Max full background scan cycles before pausing
-const unsigned long WIFI_CONNECT_ATTEMPT_TIMEOUT_MS = 10000; // Per-network connection timeout
-const unsigned long WIFI_UDP_START_DELAY_MS = 300;  // Let the network stack settle briefly before binding UDP sockets
-const unsigned long UDP_START_RETRY_INTERVAL_MS = 1000; // Avoid tight begin()/stop() churn if sockets are not ready yet
+// WiFi connection configuration (one-shot, no auto-reconnect)
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 10000;  // Per-network connection timeout in setup()
+const unsigned long WIFI_CHECK_INTERVAL_MS = 1000;    // How often to poll WiFi status in loop()
+const unsigned long WIFI_UDP_START_DELAY_MS = 300;    // Let the network stack settle before binding UDP sockets
+const unsigned long UDP_START_RETRY_INTERVAL_MS = 1000;
 unsigned long lastWifiCheckMs = 0;
-unsigned long lastWifiDisconnectMs = 0;
 unsigned long wifiConnectedAtMs = 0;
 unsigned long lastUdpStartAttemptMs = 0;
-int reconnectAttemptCount = 0;
-bool reconnectInProgress = false;
-bool wifiAttemptActive = false;
-unsigned long wifiAttemptStartMs = 0;
-int wifiAttemptNetworkIndex = -1;
-int wifiCycleStartIndex = -1;
-int wifiNetworksTriedThisCycle = 0;
 bool udpServersStarted = false;
 bool cachedWifiConnected = false;
 
@@ -607,9 +597,7 @@ void updateWifiStatusMatrix(unsigned long now, bool wifiConnected) {
   };
   static int lastMode = WIFI_MATRIX_MODE_OFF;
 
-  bool shouldBlink = !wifiConnected &&
-                     countConfiguredWifiNetworks() > 0 &&
-                     (wifiAttemptActive || reconnectInProgress || lastWifiDisconnectMs > 0);
+  bool shouldBlink = !wifiConnected && currentNetworkIndex < 0;
 
   if (wifiConnected) {
     if (lastMode != WIFI_MATRIX_MODE_SOLID) {
@@ -1313,105 +1301,7 @@ void ensureUdpServersStarted(unsigned long now, bool wifiConnected) {
   Serial.println("Ready for UDP control commands");
 }
 
-void resetWifiAttemptState() {
-  wifiAttemptActive = false;
-  wifiAttemptStartMs = 0;
-  wifiAttemptNetworkIndex = -1;
-  wifiCycleStartIndex = -1;
-  wifiNetworksTriedThisCycle = 0;
-}
-
-void startWifiAttempt(int index, unsigned long now) {
-  if (!isWifiNetworkConfigured(index)) {
-    return;
-  }
-
-  int configuredCount = countConfiguredWifiNetworks();
-  wifiAttemptActive = true;
-  wifiAttemptStartMs = now;
-  wifiAttemptNetworkIndex = index;
-
-  Serial.print("WiFi connect attempt [");
-  Serial.print(wifiNetworksTriedThisCycle + 1);
-  Serial.print("/");
-  Serial.print(configuredCount);
-  Serial.print("]: ");
-  Serial.println(wifiNetworks[index].ssid);
-
-  WiFi.disconnect();
-  configureWifiForNetwork(index);
-  WiFi.begin(wifiNetworks[index].ssid, wifiNetworks[index].password);
-}
-
-bool startNextWifiAttempt(unsigned long now) {
-  int configuredCount = countConfiguredWifiNetworks();
-  if (configuredCount == 0 || wifiNetworksTriedThisCycle >= configuredCount) {
-    return false;
-  }
-
-  int nextIndex = wifiAttemptNetworkIndex;
-  if (wifiNetworksTriedThisCycle == 0) {
-    nextIndex = wifiCycleStartIndex;
-  } else {
-    nextIndex = findNextConfiguredWifiNetwork(wifiAttemptNetworkIndex);
-  }
-
-  if (!isWifiNetworkConfigured(nextIndex)) {
-    return false;
-  }
-
-  startWifiAttempt(nextIndex, now);
-  return true;
-}
-
-void beginWifiReconnectCycle(unsigned long now, bool immediate) {
-  int configuredCount = countConfiguredWifiNetworks();
-  if (configuredCount == 0) {
-    currentNetworkIndex = -1;
-    reconnectInProgress = false;
-    resetWifiAttemptState();
-    return;
-  }
-
-  reconnectInProgress = true;
-  wifiCycleStartIndex = isWifiNetworkConfigured(currentNetworkIndex)
-                          ? currentNetworkIndex
-                          : findFirstConfiguredWifiNetwork();
-  wifiAttemptNetworkIndex = -1;
-  wifiNetworksTriedThisCycle = 0;
-  wifiAttemptActive = false;
-  wifiAttemptStartMs = 0;
-
-  Serial.println("\n=== WiFi Background Connect ===");
-  wifiMatrixBlinkVisible = true;
-  lastWifiMatrixBlinkMs = now;
-  renderWifiStatusMatrix(true);
-  if (immediate) {
-    startNextWifiAttempt(now);
-  }
-}
-
-void finishWifiReconnectCycle(unsigned long now) {
-  reconnectInProgress = false;
-  resetWifiAttemptState();
-  reconnectAttemptCount++;
-  lastWifiDisconnectMs = now;
-
-  if (reconnectAttemptCount >= MAX_RECONNECT_ATTEMPTS) {
-    Serial.print("WiFi unavailable after ");
-    Serial.print(MAX_RECONNECT_ATTEMPTS);
-    Serial.println(" background scan cycles; continuing RC-only and retrying later");
-    reconnectAttemptCount = 0;
-  } else {
-    Serial.print("WiFi scan cycle failed (");
-    Serial.print(reconnectAttemptCount);
-    Serial.print("/");
-    Serial.print(MAX_RECONNECT_ATTEMPTS);
-    Serial.println("); RC remains active");
-  }
-}
-
-// Check WiFi status and advance the non-blocking background connection state
+// Check WiFi status - monitoring only, no auto-reconnect
 bool checkWiFiStatus() {
   unsigned long now = millis();
 
@@ -1424,74 +1314,26 @@ bool checkWiFiStatus() {
   cachedWifiConnected = wifiConnected;
 
   if (wifiConnected) {
-    bool hadPreviousWifiSession = currentNetworkIndex >= 0;
-    if (wifiAttemptActive && isWifiNetworkConfigured(wifiAttemptNetworkIndex)) {
-      currentNetworkIndex = wifiAttemptNetworkIndex;
-    }
-
     if (wifiConnectedAtMs == 0) {
       wifiConnectedAtMs = now;
     }
-
 #if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_UDP
-    bool shouldReportWifiConnected = (lastWifiDisconnectMs > 0 || !udpServersStarted);
-#else
-    bool shouldReportWifiConnected = (lastWifiDisconnectMs > 0);
-#endif
-    if (shouldReportWifiConnected) {
-      printWifiConnectedInfo(currentNetworkIndex);
-      if (lastWifiDisconnectMs > 0 && hadPreviousWifiSession) {
-        Serial.println("WiFi link restored");
-      }
-    }
-
-    lastWifiDisconnectMs = 0;
-    reconnectAttemptCount = 0;
-    reconnectInProgress = false;
-    resetWifiAttemptState();
-#if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_UDP
-    ensureUdpServersStarted(now, wifiConnected);
+    ensureUdpServersStarted(now, true);
 #endif
     return true;
   }
 
+  // WiFi lost - stop transport, run RC-only (no reconnect attempt)
+  static bool reportedDisconnect = false;
+  if (!reportedDisconnect) {
+    Serial.println("WiFi lost - running RC-only, restart Arduino to reconnect");
+    reportedDisconnect = true;
+  }
 #if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_UDP
   stopUdpServers();
 #endif
   wifiConnectedAtMs = 0;
   lastUdpStartAttemptMs = 0;
-
-  if (lastWifiDisconnectMs == 0) {
-    lastWifiDisconnectMs = now;
-    Serial.println("\nWiFi not connected - RC remains active while background connect runs");
-  }
-
-  if (wifiAttemptActive) {
-    if (now - wifiAttemptStartMs >= WIFI_CONNECT_ATTEMPT_TIMEOUT_MS) {
-      Serial.print("WiFi attempt timed out: ");
-      Serial.println(wifiNetworks[wifiAttemptNetworkIndex].ssid);
-      WiFi.disconnect();
-      wifiAttemptActive = false;
-      wifiAttemptStartMs = 0;
-      wifiNetworksTriedThisCycle++;
-
-      if (!startNextWifiAttempt(now)) {
-        finishWifiReconnectCycle(now);
-      }
-    }
-    return false;
-  }
-
-  if (!reconnectInProgress) {
-    if (now - lastWifiDisconnectMs < WIFI_RECONNECT_DELAY_MS) {
-      return false;
-    }
-    beginWifiReconnectCycle(now, false);
-  }
-
-  if (!startNextWifiAttempt(now)) {
-    finishWifiReconnectCycle(now);
-  }
   return false;
 }
 
@@ -1570,12 +1412,46 @@ void setup() {
   Serial.println(" ms");
   delay(ESC_SAFE_BOOT_NEUTRAL_MS);
 
-  // Start WiFi in the background so RC is usable immediately after setup finishes.
+  // One-shot WiFi connect: try each configured network once, then run RC-only if all fail.
+  // No auto-reconnect in loop() - restart Arduino if WiFi is needed after a disconnect.
   int configuredWifiCount = countConfiguredWifiNetworks();
   if (configuredWifiCount > 0) {
-    Serial.println("WiFi background connect enabled - RC available immediately");
-    lastWifiDisconnectMs = millis();
-    beginWifiReconnectCycle(millis(), true);
+    Serial.println("WiFi connecting (one-shot, no auto-reconnect)...");
+    bool connected = false;
+    for (int i = 0; i < MAX_WIFI_NETWORKS && !connected; i++) {
+      if (!isWifiNetworkConfigured(i)) continue;
+
+      Serial.print("  Trying: ");
+      Serial.print(wifiNetworks[i].ssid);
+
+      WiFi.disconnect();
+      configureWifiForNetwork(i);
+      WiFi.begin(wifiNetworks[i].ssid, wifiNetworks[i].password);
+
+      unsigned long attemptStart = millis();
+      while (WiFi.status() != WL_CONNECTED &&
+             millis() - attemptStart < WIFI_CONNECT_TIMEOUT_MS) {
+        delay(100);
+      }
+
+      if (WiFi.status() == WL_CONNECTED) {
+        currentNetworkIndex = i;
+        connected = true;
+        printWifiConnectedInfo(i);
+        wifiConnectedAtMs = millis();
+      } else {
+        Serial.println(" - failed");
+        WiFi.disconnect();
+      }
+    }
+
+    if (connected) {
+      wifiMatrixBlinkVisible = true;
+      renderWifiStatusMatrix(true);
+    } else {
+      Serial.println("WiFi unavailable - running RC-only mode");
+      currentNetworkIndex = -1;
+    }
   } else {
     Serial.println("No WiFi networks configured - Running in RC only mode");
   }
@@ -1618,7 +1494,7 @@ void loop() {
   // 1. Read RC inputs first so manual control stays responsive even during WiFi retries
   readRcInputs();
 
-  // 2. Check WiFi status and auto-reconnect in the background
+  // 2. Check WiFi status (monitoring only, no auto-reconnect)
   bool wifiConnected = checkWiFiStatus();
 
   // 3. Poll again after WiFi check (may have missed pulses)
