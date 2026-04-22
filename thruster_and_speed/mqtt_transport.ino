@@ -7,6 +7,11 @@
 
 WiFiClient mqttWifiClient;
 PubSubClient mqttClient(mqttWifiClient);
+
+// PubSubClient defaults to 15 s socket timeout — that blocks the main loop
+// (and therefore RC processing) for up to 30 s per connect attempt and 15 s
+// per partial MQTT read inside loop().  Keep it short so RC stays responsive.
+constexpr uint16_t MQTT_SOCKET_TIMEOUT_S = 1;
 unsigned long lastMqttReconnectAttemptMs = 0;
 bool mqttOnlineStateDirty = false;
 byte nextMqttTelemetryTask = 0;
@@ -51,6 +56,7 @@ bool connectMqttBroker() {
   static bool callbackSet = false;
 
   mqttClient.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
+  mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_S);
 
   if (!callbackSet) {
     mqttClient.setCallback(mqttMessageCallback);
