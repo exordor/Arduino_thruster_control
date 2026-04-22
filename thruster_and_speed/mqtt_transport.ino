@@ -12,6 +12,12 @@ PubSubClient mqttClient(mqttWifiClient);
 // (and therefore RC processing) for up to 30 s per connect attempt and 15 s
 // per partial MQTT read inside loop().  Keep it short so RC stays responsive.
 constexpr uint16_t MQTT_SOCKET_TIMEOUT_S = 1;
+
+// WiFiS3 WiFiClient::connect() sends the TCP SYN via modem.write() and blocks
+// until the ESP32 responds.  Without a connection timeout the ESP32 uses its
+// default TCP timeout (30+ s), freezing the main loop the entire time.
+// 2 s is enough for a LAN broker and keeps RC responsive.
+constexpr int MQTT_TCP_CONNECT_TIMEOUT_MS = 2000;
 unsigned long lastMqttReconnectAttemptMs = 0;
 bool mqttOnlineStateDirty = false;
 byte nextMqttTelemetryTask = 0;
@@ -57,6 +63,7 @@ bool connectMqttBroker() {
 
   mqttClient.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
   mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_S);
+  mqttWifiClient.setConnectionTimeout(MQTT_TCP_CONNECT_TIMEOUT_MS);
 
   if (!callbackSet) {
     mqttClient.setCallback(mqttMessageCallback);
