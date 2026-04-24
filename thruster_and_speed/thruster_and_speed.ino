@@ -160,19 +160,18 @@ const unsigned long STATUS_SEND_INTERVAL_MS = 100;   // Status update rate (10Hz
 const unsigned long MONITOR_SEND_INTERVAL_MS = 1000;  // Monitor port update rate (1Hz)
 const unsigned long MONITOR_PACKET_INTERVAL_MS = (MONITOR_SEND_INTERVAL_MS + 2) / 3; // Stagger S/F/D across loops at ~1 Hz each
 
-// === WiFi LED Matrix Indicator ===
-const unsigned long WIFI_MATRIX_BLINK_INTERVAL_MS = 120;
-uint8_t WIFI_MATRIX_ICON[8][12] = {
-  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-  {0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0},
-  {0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0},
-  {0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0},
-  {0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0},
-  {0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0},
-  {0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0},
+// === MQTT LED Matrix Indicator ===
+uint8_t MQTT_MATRIX_M[8][12] = {
+  {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+  {1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1},
+  {1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1},
+  {1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1},
+  {1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1},
+  {1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1},
+  {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
   {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 };
-uint8_t WIFI_MATRIX_OFF[8][12] = {
+uint8_t MQTT_MATRIX_OFF[8][12] = {
   {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
   {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
   {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
@@ -203,8 +202,7 @@ PwmOut escR(ESC_RIGHT_OUT);
 ArduinoLEDMatrix ledMatrix;
 bool escPwmInitialized = false;
 bool ledMatrixInitialized = false;
-bool wifiMatrixBlinkVisible = false;
-unsigned long lastWifiMatrixBlinkMs = 0;
+bool mqttMatrixVisible = false;
 
 // === RC State Variables ===
 // RC state - interrupt-based capture
@@ -573,62 +571,19 @@ void printPwmEventDebug() {
   lastMode = currentMode;
 }
 
-void renderWifiStatusMatrix(bool lit) {
+void updateMqttStatusMatrix(unsigned long now) {
   if (!ledMatrixInitialized) {
     return;
   }
 
-  if (lit) {
-    ledMatrix.renderBitmap(WIFI_MATRIX_ICON, 8, 12);
-  } else {
-    ledMatrix.renderBitmap(WIFI_MATRIX_OFF, 8, 12);
-  }
-}
+  bool connected = isTransportConnected();
 
-void updateWifiStatusMatrix(unsigned long now, bool wifiConnected) {
-  if (!ledMatrixInitialized) {
-    return;
-  }
-
-  enum WifiMatrixMode {
-    WIFI_MATRIX_MODE_OFF = 0,
-    WIFI_MATRIX_MODE_BLINK = 1,
-    WIFI_MATRIX_MODE_SOLID = 2
-  };
-  static int lastMode = WIFI_MATRIX_MODE_OFF;
-
-  bool shouldBlink = !wifiConnected && currentNetworkIndex < 0;
-
-  if (wifiConnected) {
-    if (lastMode != WIFI_MATRIX_MODE_SOLID) {
-      renderWifiStatusMatrix(true);
-      wifiMatrixBlinkVisible = true;
-    }
-    lastMode = WIFI_MATRIX_MODE_SOLID;
-    return;
-  }
-
-  if (!shouldBlink) {
-    if (lastMode != WIFI_MATRIX_MODE_OFF) {
-      renderWifiStatusMatrix(false);
-      wifiMatrixBlinkVisible = false;
-    }
-    lastMode = WIFI_MATRIX_MODE_OFF;
-    return;
-  }
-
-  if (lastMode != WIFI_MATRIX_MODE_BLINK) {
-    wifiMatrixBlinkVisible = true;
-    lastWifiMatrixBlinkMs = now;
-    renderWifiStatusMatrix(true);
-    lastMode = WIFI_MATRIX_MODE_BLINK;
-    return;
-  }
-
-  if (now - lastWifiMatrixBlinkMs >= WIFI_MATRIX_BLINK_INTERVAL_MS) {
-    wifiMatrixBlinkVisible = !wifiMatrixBlinkVisible;
-    lastWifiMatrixBlinkMs = now;
-    renderWifiStatusMatrix(wifiMatrixBlinkVisible);
+  if (connected && !mqttMatrixVisible) {
+    ledMatrix.renderBitmap(MQTT_MATRIX_M, 8, 12);
+    mqttMatrixVisible = true;
+  } else if (!connected && mqttMatrixVisible) {
+    ledMatrix.renderBitmap(MQTT_MATRIX_OFF, 8, 12);
+    mqttMatrixVisible = false;
   }
 }
 
@@ -1391,8 +1346,8 @@ void setup() {
 
   ledMatrixInitialized = ledMatrix.begin();
   if (ledMatrixInitialized) {
-    renderWifiStatusMatrix(false);
-    Serial.println("LED Matrix WiFi indicator initialized");
+    ledMatrix.renderBitmap(MQTT_MATRIX_OFF, 8, 12);
+    Serial.println("LED Matrix MQTT indicator initialized");
   } else {
     Serial.println("LED Matrix init FAILED");
   }
@@ -1446,8 +1401,7 @@ void setup() {
     }
 
     if (connected) {
-      wifiMatrixBlinkVisible = true;
-      renderWifiStatusMatrix(true);
+      mqttMatrixVisible = false;
     } else {
       Serial.println("WiFi unavailable - running RC-only mode");
       currentNetworkIndex = -1;
@@ -1500,30 +1454,26 @@ void loop() {
   // 3. Poll again after WiFi check (may have missed pulses)
   pollFlowSensor();
 
-  // 4. Read transport commands and heartbeat only after sockets are ready
-  pollTransportInput(now, wifiConnected);
-
-  // 5. Poll again after UDP read (critical - UDP can block)
-  pollFlowSensor();
-
-  // 6. Determine control mode and outputs (fast)
+  // 4. Determine control mode and outputs (fast)
   determineControlMode();
 
-  // 7. Update thrusters (fast)
+  // 5. Update thrusters (fast) — before any potentially blocking transport I/O
   updateThrusters();
 
-  // 7.5. Dedicated PWM debug stream for investigating twitching
+  // 6. Dedicated PWM debug stream for investigating twitching
   printPwmEventDebug();
   printPwmDebug(now);
 
-  // 7.6. LED Matrix WiFi status indicator
-  updateWifiStatusMatrix(now, wifiConnected);
+  // 7. LED Matrix status indicator
+  updateMqttStatusMatrix(now);
 
   // 8. Refresh the rolling flow estimate before any outbound telemetry send.
   calculateFlowData(now);
 
-  // 9. Allow at most one outbound UDP task per loop, after control outputs are updated.
-  // Flow is prioritized inside serviceOneTransportSendTask() so it is less likely to be delayed.
+  // 9. Poll transport input (may block on MQTT connect — placed after thruster update)
+  pollTransportInput(now, wifiConnected);
+
+  // 10. Allow at most one outbound transport task per loop
   serviceOneTransportSendTask(now, wifiConnected);
 
   // 10. DHT is low priority and slow-changing, so refresh it after flow/send work.

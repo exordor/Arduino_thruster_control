@@ -16,12 +16,15 @@ constexpr uint16_t MQTT_SOCKET_TIMEOUT_S = 1;
 // WiFiS3 WiFiClient::connect() sends the TCP SYN via modem.write() and blocks
 // until the ESP32 responds.  Without a connection timeout the ESP32 uses its
 // default TCP timeout (30+ s), freezing the main loop the entire time.
-// 2 s is enough for a LAN broker and keeps RC responsive.
-constexpr int MQTT_TCP_CONNECT_TIMEOUT_MS = 2000;
+// 1 s is enough for a LAN broker and keeps RC responsive.
+constexpr int MQTT_TCP_CONNECT_TIMEOUT_MS = 1000;
 unsigned long lastMqttReconnectAttemptMs = 0;
 bool mqttOnlineStateDirty = false;
 byte nextMqttTelemetryTask = 0;
 unsigned long mqttCallbackNow = 0;
+int mqttConnectFailCount = 0;
+bool mqttGaveUp = false;
+bool mqttPrevWifiConnected = false;
 
 enum MqttTelemetryTask : byte {
   MQTT_TELEMETRY_TASK_STATUS = 0,
@@ -218,15 +221,33 @@ bool isTransportConnected() {
 
 void ensureMqttConnected(unsigned long now, bool wifiConnected) {
   if (!wifiConnected) {
+    mqttPrevWifiConnected = false;
     return;
   }
+
+  // Reset on WiFi reconnect
+  if (!mqttPrevWifiConnected) {
+    mqttGaveUp = false;
+    mqttConnectFailCount = 0;
+    lastMqttReconnectAttemptMs = 0;
+  }
+  mqttPrevWifiConnected = true;
 
   if (mqttClient.connected()) {
+    mqttConnectFailCount = 0;
     return;
   }
 
+  if (mqttGaveUp) {
+    return;
+  }
+
+  // Exponential backoff: 2s, 4s, 8s, ... up to 16s
+  unsigned long backoff = MQTT_RECONNECT_INTERVAL_MS << mqttConnectFailCount;
+  if (backoff > 16000) backoff = 16000;
+
   if (lastMqttReconnectAttemptMs != 0 &&
-      now - lastMqttReconnectAttemptMs < MQTT_RECONNECT_INTERVAL_MS) {
+      now - lastMqttReconnectAttemptMs < backoff) {
     return;
   }
 
@@ -234,7 +255,17 @@ void ensureMqttConnected(unsigned long now, bool wifiConnected) {
   if (connectMqttBroker()) {
     mqttOnlineStateDirty = true;
     lastMqttReconnectAttemptMs = 0;
+    mqttConnectFailCount = 0;
     servicePendingOnlineState();
+  } else {
+    mqttConnectFailCount++;
+    if (MQTT_MAX_CONNECT_ATTEMPTS > 0 &&
+        mqttConnectFailCount >= MQTT_MAX_CONNECT_ATTEMPTS) {
+      mqttGaveUp = true;
+      Serial.print("MQTT gave up after ");
+      Serial.print(mqttConnectFailCount);
+      Serial.println(" attempts (reconnect on WiFi reset)");
+    }
   }
 }
 
@@ -244,5 +275,19 @@ void pollMqttTransport(unsigned long now, bool wifiConnected) {
     mqttCallbackNow = now;
     mqttClient.loop();
   }
+}
+
+bool isMqttConnected() {
+  return mqttClient.connected();
+}
+
+bool isMqttGivenUp() {
+  return mqttGaveUp;
+}
+
+void resetMqttGaveUp() {
+  mqttGaveUp = false;
+  mqttConnectFailCount = 0;
+  lastMqttReconnectAttemptMs = 0;
 }
 #endif
