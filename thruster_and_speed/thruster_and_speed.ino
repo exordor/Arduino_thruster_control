@@ -7,6 +7,8 @@
 
 bool isControllerOnline(unsigned long now);
 bool isTransportConnected();
+bool isMqttConnected();
+bool isMqttGivenUp();
 void pollTransportInput(unsigned long now, bool wifiConnected);
 void serviceOneTransportSendTask(unsigned long now, bool wifiConnected);
 
@@ -89,7 +91,8 @@ WifiNetwork wifiNetworks[MAX_WIFI_NETWORKS] = {
 int currentNetworkIndex = -1;
 
 // WiFi connection configuration (one-shot, no auto-reconnect)
-const unsigned long WIFI_CONNECT_TIMEOUT_MS = 10000;  // Per-network connection timeout in setup()
+const int WIFI_MAX_CONNECT_ATTEMPTS = 1;                // Per-network connect attempts in setup()
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 5000;  // Per-network connection timeout in setup()
 const unsigned long WIFI_CHECK_INTERVAL_MS = 1000;    // How often to poll WiFi status in loop()
 const unsigned long WIFI_UDP_START_DELAY_MS = 300;    // Let the network stack settle before binding UDP sockets
 const unsigned long UDP_START_RETRY_INTERVAL_MS = 1000;
@@ -160,8 +163,28 @@ const unsigned long STATUS_SEND_INTERVAL_MS = 100;   // Status update rate (10Hz
 const unsigned long MONITOR_SEND_INTERVAL_MS = 1000;  // Monitor port update rate (1Hz)
 const unsigned long MONITOR_PACKET_INTERVAL_MS = (MONITOR_SEND_INTERVAL_MS + 2) / 3; // Stagger S/F/D across loops at ~1 Hz each
 
-// === MQTT LED Matrix Indicator ===
-uint8_t MQTT_MATRIX_M[8][12] = {
+// === LED Matrix State Display ===
+enum DisplayState : byte {
+  DISPLAY_BOOT = 0,
+  DISPLAY_MQTT_ACTIVE = 1,
+  DISPLAY_RC_STANDBY = 2,
+  DISPLAY_CONNECTING = 3,
+  DISPLAY_DEGRADED = 4,
+};
+
+constexpr unsigned long MATRIX_BLINK_SLOW_MS = 1000;
+
+uint8_t MATRIX_BOOT[8][12] = {
+  {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+  {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+  {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+  {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+  {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+  {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+  {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+  {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+};
+uint8_t MATRIX_M[8][12] = {
   {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
   {1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1},
   {1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1},
@@ -171,7 +194,27 @@ uint8_t MQTT_MATRIX_M[8][12] = {
   {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
   {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 };
-uint8_t MQTT_MATRIX_OFF[8][12] = {
+uint8_t MATRIX_R[8][12] = {
+  {0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0},
+  {0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+  {0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0},
+  {0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0},
+  {0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0},
+  {0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0},
+  {0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+};
+uint8_t MATRIX_W[8][12] = {
+  {0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0},
+  {0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0},
+  {0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0},
+  {0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0},
+  {0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0},
+  {0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 0},
+  {0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0},
+  {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+};
+uint8_t MATRIX_OFF[8][12] = {
   {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
   {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
   {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
@@ -181,6 +224,10 @@ uint8_t MQTT_MATRIX_OFF[8][12] = {
   {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
   {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 };
+
+DisplayState currentDisplayState = DISPLAY_BOOT;
+bool matrixBlinkPhase = true;
+unsigned long lastMatrixBlinkMs = 0;
 
 // === ESC Configuration ===
 const int RX_VALID_MIN = 950;
@@ -202,7 +249,6 @@ PwmOut escR(ESC_RIGHT_OUT);
 ArduinoLEDMatrix ledMatrix;
 bool escPwmInitialized = false;
 bool ledMatrixInitialized = false;
-bool mqttMatrixVisible = false;
 
 // === RC State Variables ===
 // RC state - interrupt-based capture
@@ -571,19 +617,59 @@ void printPwmEventDebug() {
   lastMode = currentMode;
 }
 
-void updateMqttStatusMatrix(unsigned long now) {
-  if (!ledMatrixInitialized) {
-    return;
+DisplayState computeDisplayState(unsigned long now) {
+  bool wifiConn = cachedWifiConnected;
+  bool mqttConn = isMqttConnected();
+  bool mqttGave = isMqttGivenUp();
+
+  if (mqttConn && currentMode == 1) return DISPLAY_MQTT_ACTIVE;
+  if (mqttConn) return DISPLAY_RC_STANDBY;
+  if (wifiConn && !mqttGave) return DISPLAY_CONNECTING;
+  return DISPLAY_DEGRADED;
+}
+
+void updateStatusMatrix(unsigned long now) {
+  if (!ledMatrixInitialized) return;
+
+  DisplayState state = computeDisplayState(now);
+
+  unsigned long blinkInterval = 0;
+  if (state == DISPLAY_CONNECTING || state == DISPLAY_DEGRADED) {
+    blinkInterval = MATRIX_BLINK_SLOW_MS;
   }
 
-  bool connected = isTransportConnected();
+  if (blinkInterval > 0 && now - lastMatrixBlinkMs >= blinkInterval) {
+    matrixBlinkPhase = !matrixBlinkPhase;
+    lastMatrixBlinkMs = now;
+  }
 
-  if (connected && !mqttMatrixVisible) {
-    ledMatrix.renderBitmap(MQTT_MATRIX_M, 8, 12);
-    mqttMatrixVisible = true;
-  } else if (!connected && mqttMatrixVisible) {
-    ledMatrix.renderBitmap(MQTT_MATRIX_OFF, 8, 12);
-    mqttMatrixVisible = false;
+  if (state != currentDisplayState) {
+    currentDisplayState = state;
+    matrixBlinkPhase = true;
+    lastMatrixBlinkMs = now;
+  }
+
+  uint8_t (*bitmap)[8][12] = &MATRIX_OFF;
+  bool visible = true;
+
+  switch (state) {
+    case DISPLAY_BOOT:        bitmap = &MATRIX_BOOT; break;
+    case DISPLAY_MQTT_ACTIVE: bitmap = &MATRIX_M; break;
+    case DISPLAY_RC_STANDBY:  bitmap = &MATRIX_R; break;
+    case DISPLAY_CONNECTING:  bitmap = &MATRIX_W; visible = matrixBlinkPhase; break;
+    case DISPLAY_DEGRADED:    bitmap = &MATRIX_R; visible = matrixBlinkPhase; break;
+  }
+
+  static bool prevVisible = true;
+  static DisplayState prevState = DISPLAY_BOOT;
+  if (state != prevState || visible != prevVisible) {
+    if (visible) {
+      ledMatrix.renderBitmap(*bitmap, 8, 12);
+    } else {
+      ledMatrix.renderBitmap(MATRIX_OFF, 8, 12);
+    }
+    prevState = state;
+    prevVisible = visible;
   }
 }
 
@@ -1346,8 +1432,8 @@ void setup() {
 
   ledMatrixInitialized = ledMatrix.begin();
   if (ledMatrixInitialized) {
-    ledMatrix.renderBitmap(MQTT_MATRIX_OFF, 8, 12);
-    Serial.println("LED Matrix MQTT indicator initialized");
+    ledMatrix.renderBitmap(MATRIX_BOOT, 8, 12);
+    Serial.println("LED Matrix status display initialized");
   } else {
     Serial.println("LED Matrix init FAILED");
   }
@@ -1379,29 +1465,38 @@ void setup() {
       Serial.print("  Trying: ");
       Serial.print(wifiNetworks[i].ssid);
 
-      WiFi.disconnect();
-      configureWifiForNetwork(i);
-      WiFi.begin(wifiNetworks[i].ssid, wifiNetworks[i].password);
+      for (int attempt = 0; attempt < WIFI_MAX_CONNECT_ATTEMPTS && !connected; attempt++) {
+        if (attempt > 0) {
+          Serial.print("  Retry #");
+          Serial.print(attempt + 1);
+          Serial.print(": ");
+          Serial.print(wifiNetworks[i].ssid);
+        }
 
-      unsigned long attemptStart = millis();
-      while (WiFi.status() != WL_CONNECTED &&
-             millis() - attemptStart < WIFI_CONNECT_TIMEOUT_MS) {
-        delay(100);
-      }
-
-      if (WiFi.status() == WL_CONNECTED) {
-        currentNetworkIndex = i;
-        connected = true;
-        printWifiConnectedInfo(i);
-        wifiConnectedAtMs = millis();
-      } else {
-        Serial.println(" - failed");
         WiFi.disconnect();
+        configureWifiForNetwork(i);
+        WiFi.begin(wifiNetworks[i].ssid, wifiNetworks[i].password);
+
+        unsigned long attemptStart = millis();
+        while (WiFi.status() != WL_CONNECTED &&
+               millis() - attemptStart < WIFI_CONNECT_TIMEOUT_MS) {
+          delay(100);
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
+          currentNetworkIndex = i;
+          connected = true;
+          printWifiConnectedInfo(i);
+          wifiConnectedAtMs = millis();
+        } else {
+          Serial.println(" - failed");
+          WiFi.disconnect();
+        }
       }
     }
 
     if (connected) {
-      mqttMatrixVisible = false;
+      currentDisplayState = DISPLAY_BOOT;  // Will transition on first loop()
     } else {
       Serial.println("WiFi unavailable - running RC-only mode");
       currentNetworkIndex = -1;
@@ -1465,7 +1560,7 @@ void loop() {
   printPwmDebug(now);
 
   // 7. LED Matrix status indicator
-  updateMqttStatusMatrix(now);
+  updateStatusMatrix(now);
 
   // 8. Refresh the rolling flow estimate before any outbound telemetry send.
   calculateFlowData(now);
