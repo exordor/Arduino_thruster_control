@@ -3,6 +3,7 @@
 #include "pwm.h"
 #include <WiFiUdp.h>
 #include "DHT.h"
+#include "FspTimer.h"
 #include "transport_config.h"
 
 bool isControllerOnline(unsigned long now);
@@ -356,11 +357,7 @@ unsigned long lastMonitorSendMs = 0 - MONITOR_PACKET_INTERVAL_MS;  // Allow imme
 // === Flow Meter State ===
 unsigned long lastFlowCalcMs = 0;     // Last time flow data was calculated
 unsigned long lastFlowSendMs = 0 - FLOW_SEND_INTERVAL_MS;  // Allow immediate first send
-int lastFlowState = 0;
-unsigned long flowChangeCount = 0;         // Changes accumulated in the current 200 ms bin
 unsigned long flowRollingChangeCount = 0;  // Sum of changes across the rolling 1 s window
-unsigned long flowTotalChangeCount = 0;    // Total accepted changes since boot
-unsigned long flowLastEdgeUs = 0;
 unsigned long flowWindowChanges[FLOW_ESTIMATE_BIN_COUNT] = {0};
 byte flowWindowIndex = 0;
 byte flowWindowBinsFilled = 0;
@@ -369,6 +366,35 @@ float flowLmin = 0.0f;
 float flowVelocityRaw = 0.0f;
 float flowVelocity = 0.0f;
 double totalLiters = 0.0;
+
+// Flow sensor timer ISR (500 Hz polling on D7 — decoupled from main loop)
+FspTimer flowTimer;
+bool flowTimerActive = false;
+volatile unsigned long flowIsrChangeCount = 0;
+volatile unsigned long flowIsrTotalChangeCount = 0;
+volatile int flowIsrLastState = 0;
+volatile unsigned long flowIsrLastEdgeUs = 0;
+
+// Polling fallback state (used only if no free hardware timer)
+int lastFlowState = 0;
+unsigned long flowChangeCount = 0;
+
+void flowTimerCallback(timer_callback_args_t *args) {
+  (void)args;
+  int s = digitalRead(FLOW_SENSOR_PIN);
+  if (s != flowIsrLastState) {
+    unsigned long nowUs = micros();
+    unsigned long sinceLast = nowUs - flowIsrLastEdgeUs;
+    if (flowIsrLastEdgeUs != 0 && sinceLast < FLOW_GLITCH_FILTER_US) {
+      flowIsrLastState = s;
+      return;
+    }
+    flowIsrChangeCount++;
+    flowIsrTotalChangeCount++;
+    flowIsrLastState = s;
+    flowIsrLastEdgeUs = nowUs;
+  }
+}
 
 // === DHT22 State ===
 DHT dht1(DHT_PIN_1, DHT_TYPE);
@@ -741,23 +767,12 @@ void readRcInputs() {
 
 // === Flow Meter Functions ===
 
-// Lightweight pulse capture - call frequently throughout loop
-// This ensures we don't miss pulses even during time-consuming operations
+// Lightweight polling fallback — only used when no hardware timer is available.
 inline void pollFlowSensor() {
-  // Single read for maximum speed
   int s = digitalRead(FLOW_SENSOR_PIN);
   if (s != lastFlowState) {
-    unsigned long nowUs = micros();
-    unsigned long sinceLastEdgeUs = nowUs - flowLastEdgeUs;
     flowChangeCount++;
-    flowTotalChangeCount++;
     lastFlowState = s;
-    if (flowLastEdgeUs != 0 && sinceLastEdgeUs < FLOW_GLITCH_FILTER_US) {
-      flowChangeCount--;
-      flowTotalChangeCount--;
-      return;
-    }
-    flowLastEdgeUs = nowUs;
   }
 }
 
@@ -765,8 +780,16 @@ inline void pollFlowSensor() {
 // This keeps UDP output responsive while still smoothing the noisy D7 polling input.
 void calculateFlowData(unsigned long now) {
   while (now - lastFlowCalcMs >= FLOW_CALC_INTERVAL_MS) {
-    unsigned long completedBinChanges = flowChangeCount;
-    flowChangeCount = 0;
+    unsigned long completedBinChanges;
+    if (flowTimerActive) {
+      noInterrupts();
+      completedBinChanges = flowIsrChangeCount;
+      flowIsrChangeCount = 0;
+      interrupts();
+    } else {
+      completedBinChanges = flowChangeCount;
+      flowChangeCount = 0;
+    }
 
     flowRollingChangeCount -= flowWindowChanges[flowWindowIndex];
     flowWindowChanges[flowWindowIndex] = completedBinChanges;
@@ -799,7 +822,15 @@ void calculateFlowData(unsigned long now) {
   flowVelocity = velocityRaw * FLOW_SENSOR_SPEED_SCALE;
 
   // Total volume remains based on the sensor pulse count specification.
-  double totalPulses = (double)flowTotalChangeCount / 2.0;
+  unsigned long totalChanges;
+  if (flowTimerActive) {
+    noInterrupts();
+    totalChanges = flowIsrTotalChangeCount;
+    interrupts();
+  } else {
+    totalChanges = 0;  // polling fallback doesn't track total with glitch filter
+  }
+  double totalPulses = (double)totalChanges / 2.0;
   totalLiters = totalPulses / PULSES_PER_L;
 }
 
@@ -1430,6 +1461,31 @@ void setup() {
   lastFlowCalcMs = millis();
   Serial.println("Flow meter sensor configured on D7");
 
+  // Start hardware timer ISR for flow sensor polling (500 Hz)
+  {
+    uint8_t timerType = 0;
+    int8_t timerChannel = FspTimer::get_available_timer(timerType);
+    if (timerChannel >= 0) {
+      flowIsrLastState = digitalRead(FLOW_SENSOR_PIN);
+      if (flowTimer.begin(TIMER_MODE_PERIODIC, timerType, timerChannel,
+                          500.0, 50.0, flowTimerCallback, nullptr)) {
+        flowTimer.setup_overflow_irq(12);
+        flowTimer.open();
+        flowTimer.start();
+        flowTimerActive = true;
+        Serial.print("Flow sensor timer ISR started at 500 Hz (");
+        Serial.print(timerType == GPT_TIMER ? "GPT" : "AGT");
+        Serial.print(" ch");
+        Serial.print(timerChannel);
+        Serial.println(")");
+      } else {
+        Serial.println("Flow timer begin() failed, using polling fallback");
+      }
+    } else {
+      Serial.println("No free hardware timer — flow sensor using polling fallback");
+    }
+  }
+
   ledMatrixInitialized = ledMatrix.begin();
   if (ledMatrixInitialized) {
     ledMatrix.renderBitmap(MATRIX_BOOT, 8, 12);
@@ -1537,8 +1593,10 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 0. Poll flow sensor (lightweight, high frequency)
-  pollFlowSensor();
+  // 0. Poll flow sensor (fallback only — ISR handles this when timer is active)
+  if (!flowTimerActive) {
+    pollFlowSensor();
+  }
 
   // 1. Read RC inputs first so manual control stays responsive even during WiFi retries
   readRcInputs();
@@ -1546,8 +1604,10 @@ void loop() {
   // 2. Check WiFi status (monitoring only, no auto-reconnect)
   bool wifiConnected = checkWiFiStatus();
 
-  // 3. Poll again after WiFi check (may have missed pulses)
-  pollFlowSensor();
+  // 3. Fallback: poll again after WiFi check
+  if (!flowTimerActive) {
+    pollFlowSensor();
+  }
 
   // 4. Determine control mode and outputs (fast)
   determineControlMode();
@@ -1571,11 +1631,8 @@ void loop() {
   // 10. Allow at most one outbound transport task per loop
   serviceOneTransportSendTask(now, wifiConnected);
 
-  // 10. DHT is low priority and slow-changing, so refresh it after flow/send work.
+  // 11. DHT is low priority and slow-changing, so refresh it after flow/send work.
   readDhtSensor(now);
-
-  // 11. Final poll before loop restart
-  pollFlowSensor();
 
   // 12. Connection state transitions (fast)
   bool wifiLink = wifiConnected;
