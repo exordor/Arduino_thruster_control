@@ -67,6 +67,8 @@
 //     Time in milliseconds since the last accepted signal edge.
 //     This is useful for detecting whether the flow has stopped.
 
+#include "FspTimer.h"
+
 const byte FLOW_PIN = 7;
 
 const unsigned long REPORT_INTERVAL_MS = 1000;
@@ -93,7 +95,29 @@ unsigned long lastAcceptedEdgeUs = 0;
 unsigned long lastReportMs = 0;
 unsigned long lastSnapshotEdges = 0;
 
-int lastObservedState = HIGH;
+// Timer ISR state
+FspTimer flowTimer;
+bool flowTimerActive = false;
+volatile unsigned long isrAcceptedEdges = 0;
+volatile unsigned long isrRejectedGlitches = 0;
+volatile unsigned long isrLastAcceptedEdgeUs = 0;
+volatile int isrLastState = HIGH;
+
+void flowTimerCallback(timer_callback_args_t *args) {
+  (void)args;
+  int s = digitalRead(FLOW_PIN);
+  if (s != isrLastState) {
+    unsigned long nowUs = micros();
+    unsigned long sinceLast = nowUs - isrLastAcceptedEdgeUs;
+    if (isrLastAcceptedEdgeUs == 0 || sinceLast >= GLITCH_FILTER_US) {
+      isrAcceptedEdges++;
+      isrLastAcceptedEdgeUs = nowUs;
+    } else {
+      isrRejectedGlitches++;
+    }
+    isrLastState = s;
+  }
+}
 
 const char* levelName(int level) {
   return (level == HIGH) ? "HIGH" : "LOW";
@@ -105,11 +129,31 @@ void setup() {
   pinMode(FLOW_PIN, INPUT_PULLUP);
   delay(20);
 
-  lastObservedState = digitalRead(FLOW_PIN);
   lastReportMs = millis();
+
+  // Start hardware timer ISR for flow sensor polling (500 Hz)
+  {
+    uint8_t timerType = 0;
+    int8_t timerChannel = FspTimer::get_available_timer(timerType);
+    if (timerChannel >= 0) {
+      isrLastState = digitalRead(FLOW_PIN);
+      if (flowTimer.begin(TIMER_MODE_PERIODIC, timerType, timerChannel,
+                          500.0, 50.0, flowTimerCallback, nullptr)) {
+        flowTimer.setup_overflow_irq(12);
+        flowTimer.open();
+        flowTimer.start();
+        flowTimerActive = true;
+      }
+    }
+  }
 
   Serial.println();
   Serial.println("YF-S403 flow meter on D7");
+  if (flowTimerActive) {
+    Serial.println("Using hardware timer ISR polling (500 Hz)");
+  } else {
+    Serial.println("WARNING: no free timer, using main-loop polling");
+  }
   Serial.println("Using datasheet calibration: f = 5 * Q, 1L ~= 300 pulses");
   Serial.println("Velocity output includes raw 26 mm conversion and SENSOR_SPEED_SCALE-adjusted speed.");
   Serial.println("dt[ms]=..., state=..., edges[count]=..., glitches[count]=..., freq[Hz]=..., flow[L/min]=..., velocity_26mm_raw[m/s]=..., velocity_scaled[m/s]=..., total[L]=..., last_edge[ms]=...");
@@ -117,21 +161,22 @@ void setup() {
 
 void loop() {
   int state = digitalRead(FLOW_PIN);
-  if (state != lastObservedState) {
-    unsigned long nowUs = micros();
-    unsigned long sinceLastEdgeUs = nowUs - lastAcceptedEdgeUs;
 
-    // Ignore transitions that happen unrealistically fast.
-    // For this sensor, valid pulses at the expected flow range are far slower
-    // than this threshold, so sub-250 us changes are most likely noise.
-    if (lastAcceptedEdgeUs == 0 || sinceLastEdgeUs >= GLITCH_FILTER_US) {
-      acceptedEdges++;
-      lastAcceptedEdgeUs = nowUs;
-    } else {
-      rejectedGlitches++;
+  // Polling fallback when no hardware timer is available
+  if (!flowTimerActive) {
+    if (state != isrLastState) {
+      unsigned long nowUs = micros();
+      unsigned long sinceLastEdgeUs = nowUs - lastAcceptedEdgeUs;
+
+      if (lastAcceptedEdgeUs == 0 || sinceLastEdgeUs >= GLITCH_FILTER_US) {
+        acceptedEdges++;
+        lastAcceptedEdgeUs = nowUs;
+      } else {
+        rejectedGlitches++;
+      }
+
+      isrLastState = state;
     }
-
-    lastObservedState = state;
   }
 
   unsigned long nowMs = millis();
@@ -142,7 +187,21 @@ void loop() {
   unsigned long dtMs = nowMs - lastReportMs;
   float dtS = dtMs / 1000.0f;
 
-  unsigned long deltaEdges = acceptedEdges - lastSnapshotEdges;
+  unsigned long deltaEdges;
+  unsigned long currentGlitches;
+  unsigned long currentLastEdgeUs;
+
+  if (flowTimerActive) {
+    noInterrupts();
+    deltaEdges = isrAcceptedEdges - lastSnapshotEdges;
+    currentGlitches = isrRejectedGlitches;
+    currentLastEdgeUs = isrLastAcceptedEdgeUs;
+    interrupts();
+  } else {
+    deltaEdges = acceptedEdges - lastSnapshotEdges;
+    currentGlitches = rejectedGlitches;
+    currentLastEdgeUs = lastAcceptedEdgeUs;
+  }
 
   // Convert edge count to pulse frequency.
   // One pulse is approximately two edges, so pulses/s = (edges/2)/seconds.
@@ -152,8 +211,15 @@ void loop() {
   float flowLminNominal = freqHz / K_HZ_PER_LMIN_SPEC;
 
   // Convert total accepted edges to total volume.
-  // acceptedEdges/2 gives total pulses since boot.
-  float totalLitersNominal = (acceptedEdges / 2.0f) / PULSES_PER_LITER_SPEC;
+  unsigned long totalEdgeCount;
+  if (flowTimerActive) {
+    noInterrupts();
+    totalEdgeCount = isrAcceptedEdges;
+    interrupts();
+  } else {
+    totalEdgeCount = acceptedEdges;
+  }
+  float totalLitersNominal = (totalEdgeCount / 2.0f) / PULSES_PER_LITER_SPEC;
 
   // Optional correction multiplier for future bucket-test calibration.
   float flowLmin = flowLminNominal * FLOW_CALIBRATION_SCALE;
@@ -167,7 +233,7 @@ void loop() {
   float velocityScaled = velocity26mmRaw * SENSOR_SPEED_SCALE;
 
   // If this value keeps growing, it means no new valid pulse has arrived.
-  unsigned long ageMs = (lastAcceptedEdgeUs == 0) ? 0UL : (micros() - lastAcceptedEdgeUs) / 1000UL;
+  unsigned long ageMs = (currentLastEdgeUs == 0) ? 0UL : (micros() - currentLastEdgeUs) / 1000UL;
 
   Serial.print("dt[ms]=");
   Serial.print(dtMs);
@@ -176,7 +242,7 @@ void loop() {
   Serial.print(", edges[count]=");
   Serial.print(deltaEdges);
   Serial.print(", glitches[count]=");
-  Serial.print(rejectedGlitches);
+  Serial.print(currentGlitches);
   Serial.print(", freq[Hz]=");
   Serial.print(freqHz, 2);
   Serial.print(", flow[L/min]=");
@@ -190,6 +256,12 @@ void loop() {
   Serial.print(", last_edge[ms]=");
   Serial.println(ageMs);
 
-  lastSnapshotEdges = acceptedEdges;
+  if (flowTimerActive) {
+    noInterrupts();
+    lastSnapshotEdges = isrAcceptedEdges;
+    interrupts();
+  } else {
+    lastSnapshotEdges = acceptedEdges;
+  }
   lastReportMs = nowMs;
 }
