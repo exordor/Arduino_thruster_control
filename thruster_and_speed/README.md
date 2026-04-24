@@ -12,8 +12,8 @@ A dual thruster control system with integrated flow meter and DHT22 temperature/
 - **Dual-Port UDP**: Data (8888) and heartbeat (8889) separated for reliability
 - **MQTT Telemetry**: Thruster, flow, DHT, and online state topics for broker-based integration
 - **PING Heartbeat (8889)**: Jetson keeps Arduino "online" without touching data port in UDP mode
-- **Multi-Network WiFi**: Auto-connect to configured networks with reconnection
-- **LED Matrix Status**: Onboard LED matrix blinks while WiFi is connecting and stays lit when connected
+- **Multi-Network WiFi**: Auto-connect to configured networks (one-shot, no auto-reconnect)
+- **LED Matrix Status**: Onboard LED matrix displays system state (BOOT, M, R, W icons with blink patterns)
 - **Hardware PWM ESC Output**: Uses UNO R4 `PwmOut`, so DHT reads do not distort ESC pulses
 
 ## Transport Modes
@@ -68,7 +68,7 @@ arduino-cli compile --fqbn arduino:renesas_uno:unor4wifi \
 | **Flow Sensor** | **D7** | **Flow meter signal (polling mode)** |
 | **DHT22 #1** | **D12** | **Temperature/Humidity sensor #1** |
 | **DHT22 #2** | **D13** | **Temperature/Humidity sensor #2** |
-| **LED Matrix** | **Onboard** | **WiFi status indicator** |
+| **LED Matrix** | **Onboard** | **System status indicator (5 states)** |
 
 ## Specifications
 
@@ -242,10 +242,12 @@ Continuous operation:
 ### Current Implementation Notes
 
 - ESC outputs are held at neutral for 2 seconds on boot before the transport stack starts.
-- The LED matrix blinks while WiFi is connecting or reconnecting, and stays lit when WiFi is connected.
+- WiFi is one-shot: connects once in `setup()`, no auto-reconnect. Restart Arduino to reconnect.
+- Per-network WiFi attempts are configurable (`WIFI_MAX_CONNECT_ATTEMPTS`, default 1).
+- MQTT reconnection uses exponential backoff (2 s base, 16 s cap) with a configurable max attempts limit (`MQTT_MAX_CONNECT_ATTEMPTS`, default 2). After exhausting retries, MQTT gives up until WiFi reconnects.
 - UDP sockets are started only after WiFi is up and the link has been stable for about 300 ms; MQTT mode waits for broker connectivity instead.
 - Broadcast `HEARTBEAT` packets can appear as soon as WiFi is up in UDP mode, but unicast `S/F/D` packets are sent only after Jetson is marked online by `PING` or `C ...`.
-- The current UNO R4 `WiFiS3` core uses a blocking `WiFi.begin()` internally, so each failed SSID can still stall boot or reconnect for roughly 10 seconds before the next network is tried.
+- The main loop processes RC input and thruster updates before any transport I/O, so MQTT connection attempts never block manual control.
 
 ### Why Separate Ports?
 
@@ -306,7 +308,7 @@ To switch to continuous mode, set `ENABLE_GEAR_MODE = false` in the code.
 
 ## WiFi Configuration
 
-The Arduino automatically tries to connect to configured networks in order:
+The Arduino connects once during `setup()` to the first available configured network (one-shot, no auto-reconnect):
 
 1. IGE-Geomatics-sense-mobile (static IP: 192.168.50.100)
 2. GL-MT1300-a42 (static IP: 192.168.50.100)
@@ -314,30 +316,34 @@ The Arduino automatically tries to connect to configured networks in order:
 
 Edit the `wifiNetworks[]` array in the code to add your networks.
 
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `WIFI_MAX_CONNECT_ATTEMPTS` | 1 | Per-network retry count in setup() |
+| `WIFI_CONNECT_TIMEOUT_MS` | 5000 | Per-network connection timeout |
+
 ### Static IP Notes
 
 - Static IP is configured with the `WiFiS3` signature `config(local_ip, dns_server, gateway, subnet)`.
 - The bundled profiles reuse the router IP as both DNS server and gateway.
 - If Jetson is not fixed at `192.168.50.200`, update `JETSON_IP` in the sketch or communication will fail even if WiFi is connected.
 
-## Serial Output (UDP Mode Example)
+## Serial Output (MQTT Mode Example)
 
 Connect via USB at 115200 baud for debugging:
 
 ```
-=== WiFi Transport + RC Thruster Control + Flow Meter + DHT22 ===
+=== WiFi MQTT + RC Thruster Control + Flow Meter + DHT22 ===
 RC Control Mode: Gear Mode (9 gears, 100µs intervals)
+ESC Output: Hardware PWM (PwmOut)
 
 RC input pins configured
 RC interrupts attached
 Flow meter sensor configured on D7
-LED Matrix WiFi indicator initialized
+LED Matrix status display initialized
 DHT22 sensors configured on D12 and D13
 ESCs initialized to neutral (1500 us), holding for 2000 ms
-WiFi background connect enabled - RC available immediately
-
-=== WiFi Background Connect ===
-WiFi connect attempt [1/3]: IGE-Geomatics-sense-mobile
+WiFi connecting (one-shot, no auto-reconnect)...
+  Trying: IGE-Geomatics-sense-mobile
   Using static IP: 192.168.50.100
 
 WiFi connected
@@ -347,18 +353,13 @@ WiFi connected
   Subnet: 255.255.255.0
   RSSI: -45 dBm
 
-Data UDP server started on port 8888
-Heartbeat server started on port 8889
-Ready for UDP control commands
-
 === System Ready ===
-Control Priority: UDP mode > RC > Failsafe
-Flow Meter: D7 polling mode, 5 Hz update rate
+Control Priority: MQTT > RC > Failsafe
+Flow Meter: D7 polling mode, 200 ms updates with 1 s rolling window
 DHT22: D12 and D13, 30 s update rate
-UDP mode: Listen 8888, Send S/F/D to 192.168.50.200:28888
-     S/F/D also sent to 192.168.50.200:28889 (monitor)
-     HEARTBEAT broadcast to 192.168.50.255:8889
-     HEARTBEAT unicast to 192.168.50.200:28887 (Jetson)
+MQTT: Broker 192.168.50.200:1883
+      Subscriptions: arduino/thruster/cmd, arduino/thruster/lease
+      Telemetry: arduino/thruster/status, arduino/flow/status, arduino/dht/status
 ```
 
 ## UDP Python Client Example
@@ -448,6 +449,26 @@ python3 udp_test.py --ip 192.168.50.100
 | `1550 1600` | Custom command |
 | `stats` | Show statistics |
 | `q` / `quit` | Exit |
+
+## LED Matrix Status Display
+
+The onboard LED matrix shows the current system state at a glance:
+
+| State | Icon | Blink | Meaning |
+|-------|------|-------|---------|
+| BOOT | Frame | None | System starting, ESC arming |
+| MQTT_ACTIVE | `M` | None | MQTT connected, receiving commands |
+| RC_STANDBY | `R` | None | MQTT connected, RC in control |
+| CONNECTING | `W` | Slow (1 s) | WiFi up, MQTT connecting |
+| DEGRADED | `R` | Slow (1 s) | MQTT unavailable, RC only |
+
+**Priority**: MQTT_ACTIVE > RC_STANDBY > CONNECTING > DEGRADED
+
+**State transitions**:
+- Boot → CONNECTING (WiFi connected, first MQTT attempt) or DEGRADED (no WiFi)
+- CONNECTING → RC_STANDBY (MQTT connected) or DEGRADED (MQTT gave up)
+- RC_STANDBY ⇄ MQTT_ACTIVE (when Jetson starts/stops sending commands)
+- DEGRADED → CONNECTING (WiFi reconnect resets MQTT state)
 
 ## Jetson/ROS Integration
 
@@ -547,11 +568,12 @@ const int DEADBAND_US = 40;            // Deadband around center (20-100µs)
 - In UDP mode, check client is bound to port 8889
 - In UDP mode, confirm broadcast traffic is allowed on the WiFi network
 
-### Slow startup / delayed reconnect
+### Slow startup
 
-- In both modes, the current UNO R4 `WiFiS3` core blocks inside `WiFi.begin()` during each connection attempt
-- A failed SSID can therefore delay boot or reconnect by roughly 10 seconds before the next network is tried
-- This is a current implementation limitation, not just a serial logging delay
+- WiFi connects once in `setup()` with a configurable per-network timeout (`WIFI_CONNECT_TIMEOUT_MS`, default 5 s)
+- Each configured network is tried up to `WIFI_MAX_CONNECT_ATTEMPTS` times (default 1)
+- If all networks fail, the system enters RC-only mode without further WiFi attempts
+- MQTT connection is non-blocking: uses exponential backoff with configurable max retries (`MQTT_MAX_CONNECT_ATTEMPTS`, default 2)
 
 ### Command rate limiting
 
