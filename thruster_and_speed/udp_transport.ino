@@ -35,11 +35,8 @@ void serviceOneTransportSendTask(unsigned long now, bool wifiConnected) {
     return;
   }
 
-  // Flow stays first because it is the most timing-sensitive telemetry.
-  if (publishFlowStatusMqtt(now)) {
-    nextMqttTelemetryTask = MQTT_TELEMETRY_TASK_STATUS;
-    return;
-  }
+  // Flow is the most timing-sensitive telemetry, send it first.
+  publishFlowStatusMqtt(now);
 
   for (byte offset = 0; offset < MQTT_TELEMETRY_TASK_COUNT; ++offset) {
     byte task = (nextMqttTelemetryTask + offset) % MQTT_TELEMETRY_TASK_COUNT;

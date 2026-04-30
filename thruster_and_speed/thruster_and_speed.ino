@@ -779,6 +779,24 @@ inline void pollFlowSensor() {
 // Refresh the flow estimate every 200 ms using a rolling 1 s window.
 // This keeps UDP output responsive while still smoothing the noisy D7 polling input.
 void calculateFlowData(unsigned long now) {
+  // If the main loop was blocked for longer than the rolling window (> 1 s),
+  // the while loop below would wrap around the circular buffer and zero out
+  // all accumulated data.  Reset the window cleanly instead.
+  if (now - lastFlowCalcMs >= FLOW_ESTIMATE_WINDOW_MS) {
+    if (flowTimerActive) {
+      noInterrupts();
+      flowIsrChangeCount = 0;
+      interrupts();
+    } else {
+      flowChangeCount = 0;
+    }
+    memset(flowWindowChanges, 0, sizeof(flowWindowChanges));
+    flowRollingChangeCount = 0;
+    flowWindowIndex = 0;
+    flowWindowBinsFilled = 0;
+    lastFlowCalcMs = now;
+  }
+
   while (now - lastFlowCalcMs >= FLOW_CALC_INTERVAL_MS) {
     unsigned long completedBinChanges;
     if (flowTimerActive) {
@@ -1671,7 +1689,7 @@ void loop() {
         Serial.print("ms ");
       }
 
-      // Flow data
+      // Flow data (+ ISR diagnostic)
       Serial.print("| Flow:");
       Serial.print(flowLmin, 2);
       Serial.print("L/min ");
@@ -1679,6 +1697,16 @@ void loop() {
       Serial.print("m/s ");
       Serial.print(totalLiters, 2);
       Serial.print("L ");
+      {
+        noInterrupts();
+        unsigned long isrTotal = flowIsrTotalChangeCount;
+        interrupts();
+        Serial.print("isr:");
+        Serial.print(isrTotal);
+        Serial.print(" ");
+        Serial.print(flowTimerActive ? "T" : "P");
+        Serial.print(" ");
+      }
 
       // DHT data
       if (ENABLE_DHT_SENSORS) {
