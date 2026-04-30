@@ -274,6 +274,9 @@ const unsigned long RC_SIGNAL_TIMEOUT_US = RC_FAILSAFE_MS * 1000UL;
 const int WIFI_FILTER_ALPHA = 100;    // WiFi filter (100% = no filtering, direct control)
 const int WIFI_MAX_STEP_US = 500;     // WiFi ramp limiting (500µs per cycle = aggressive WiFi control for high speeds)
 
+// === PWM Response Mode Settings ===
+const bool ENABLE_INSTANT_RESPONSE = true;  // true = no filter/ramp (instant), false = original smooth response
+
 // === PWM Gear Mode Settings ===
 const bool ENABLE_GEAR_MODE = true;  // Enable gear mode (false=continuous)
 const int NUM_GEARS = 9;             // Number of gears (including neutral)
@@ -529,16 +532,23 @@ void applyTransportCommand(int leftUs, int rightUs, unsigned long now) {
   int rawL = constrain(leftUs, ESC_MIN, ESC_MAX);
   int rawR = constrain(rightUs, ESC_MIN, ESC_MAX);
 
-  int filtL = (wifiAvgL * (100 - WIFI_FILTER_ALPHA) + rawL * WIFI_FILTER_ALPHA) / 100;
-  int filtR = (wifiAvgR * (100 - WIFI_FILTER_ALPHA) + rawR * WIFI_FILTER_ALPHA) / 100;
+  if (!ENABLE_INSTANT_RESPONSE) {
+    int filtL = (wifiAvgL * (100 - WIFI_FILTER_ALPHA) + rawL * WIFI_FILTER_ALPHA) / 100;
+    int filtR = (wifiAvgR * (100 - WIFI_FILTER_ALPHA) + rawR * WIFI_FILTER_ALPHA) / 100;
 
-  int deltaL = constrain(filtL - wifiAvgL, -WIFI_MAX_STEP_US, WIFI_MAX_STEP_US);
-  int deltaR = constrain(filtR - wifiAvgR, -WIFI_MAX_STEP_US, WIFI_MAX_STEP_US);
+    int deltaL = constrain(filtL - wifiAvgL, -WIFI_MAX_STEP_US, WIFI_MAX_STEP_US);
+    int deltaR = constrain(filtR - wifiAvgR, -WIFI_MAX_STEP_US, WIFI_MAX_STEP_US);
 
-  wifiAvgL += deltaL;
-  wifiAvgR += deltaR;
-  wifiOutL = wifiAvgL;
-  wifiOutR = wifiAvgR;
+    wifiAvgL += deltaL;
+    wifiAvgR += deltaR;
+    wifiOutL = wifiAvgL;
+    wifiOutR = wifiAvgR;
+  } else {
+    wifiAvgL = rawL;
+    wifiAvgR = rawR;
+    wifiOutL = rawL;
+    wifiOutR = rawR;
+  }
 
   lastTransportCmdMs = now;
   lastControllerLeaseMs = now;
@@ -742,20 +752,24 @@ void readRcInputs() {
   int outR = mapToEsc((long)inR);
   int outL = mapToEsc((long)inL);
 
-  // Apply low-pass filter (RC uses smoother filtering to resist joystick drift)
-  int filtR = (rcAvgR * (100 - RC_FILTER_ALPHA) + outR * RC_FILTER_ALPHA) / 100;
-  int filtL = (rcAvgL * (100 - RC_FILTER_ALPHA) + outL * RC_FILTER_ALPHA) / 100;
+  // Apply filtering and ramp limiting (or instant passthrough)
+  if (!ENABLE_INSTANT_RESPONSE) {
+    int filtR = (rcAvgR * (100 - RC_FILTER_ALPHA) + outR * RC_FILTER_ALPHA) / 100;
+    int filtL = (rcAvgL * (100 - RC_FILTER_ALPHA) + outL * RC_FILTER_ALPHA) / 100;
 
-  // Apply soft-start ramp limiting (RC uses slower ramp for smooth control)
-  int deltaR = filtR - rcAvgR;
-  if (deltaR > RC_MAX_STEP_US) deltaR = RC_MAX_STEP_US;
-  if (deltaR < -RC_MAX_STEP_US) deltaR = -RC_MAX_STEP_US;
-  rcAvgR += deltaR;
+    int deltaR = filtR - rcAvgR;
+    if (deltaR > RC_MAX_STEP_US) deltaR = RC_MAX_STEP_US;
+    if (deltaR < -RC_MAX_STEP_US) deltaR = -RC_MAX_STEP_US;
+    rcAvgR += deltaR;
 
-  int deltaL = filtL - rcAvgL;
-  if (deltaL > RC_MAX_STEP_US) deltaL = RC_MAX_STEP_US;
-  if (deltaL < -RC_MAX_STEP_US) deltaL = -RC_MAX_STEP_US;
-  rcAvgL += deltaL;
+    int deltaL = filtL - rcAvgL;
+    if (deltaL > RC_MAX_STEP_US) deltaL = RC_MAX_STEP_US;
+    if (deltaL < -RC_MAX_STEP_US) deltaL = -RC_MAX_STEP_US;
+    rcAvgL += deltaL;
+  } else {
+    rcAvgR = outR;
+    rcAvgL = outL;
+  }
 
   // Apply RC failsafe
   if (now - lastRcUpdateR > RC_FAILSAFE_MS) rcAvgR = ESC_MID;
