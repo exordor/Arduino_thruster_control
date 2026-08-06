@@ -4,6 +4,7 @@
 #include <WiFiS3.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include "mqtt_command_gate.h"
 
 WiFiClient mqttWifiClient;
 PubSubClient mqttClient(mqttWifiClient);
@@ -25,6 +26,7 @@ unsigned long mqttCallbackNow = 0;
 int mqttConnectFailCount = 0;
 bool mqttGaveUp = false;
 bool mqttPrevWifiConnected = false;
+ThrusterCommandGate mqttCommandGate(MIN_CMD_INTERVAL_MS);
 
 enum MqttTelemetryTask : byte {
   MQTT_TELEMETRY_TASK_STATUS = 0,
@@ -48,7 +50,20 @@ void mqttMessageCallback(char* topic, uint8_t* payload, unsigned int length) {
     int leftUs = ESC_MID;
     int rightUs = ESC_MID;
     if (parseThrusterCommand(payloadBuf, leftUs, rightUs)) {
-      if (now - lastWifiCommandSentMs >= MIN_CMD_INTERVAL_MS) {
+      if (!haveTransportCmd) {
+        mqttCommandGate = ThrusterCommandGate(MIN_CMD_INTERVAL_MS);
+      }
+
+      ThrusterCommandDecision decision =
+          mqttCommandGate.observe(leftUs, rightUs, now);
+
+      // Every valid command is fresh controller input, including an identical
+      // high-rate repeat that does not need to be written to the ESC state.
+      lastTransportCmdMs = decision.receivedAtMs;
+      lastControllerLeaseMs = decision.receivedAtMs;
+      haveTransportCmd = true;
+
+      if (decision.shouldApply) {
         applyTransportCommand(leftUs, rightUs, now);
         lastWifiCommandSentMs = now;
       }

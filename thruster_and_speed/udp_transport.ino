@@ -1,8 +1,9 @@
 #include "transport_config.h"
+#include "transport_freshness.h"
 
 bool isControllerOnline(unsigned long now) {
-  return (lastControllerLeaseMs > 0) &&
-         (now - lastControllerLeaseMs < JETSON_ONLINE_TIMEOUT_MS);
+  return isTransportTimestampFresh(
+      now, lastControllerLeaseMs, JETSON_ONLINE_TIMEOUT_MS);
 }
 
 #if THRUSTER_TRANSPORT_MODE == TRANSPORT_MODE_UDP

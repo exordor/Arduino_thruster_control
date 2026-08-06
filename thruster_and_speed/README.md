@@ -57,6 +57,12 @@ arduino-cli compile --fqbn arduino:renesas_uno:unor4wifi \
   /Users/jlw/Documents/Arduino/thruster_and_speed
 ```
 
+Run the hardware-free MQTT command/lease regression tests:
+
+```bash
+/Users/jlw/Documents/Arduino/thruster_and_speed/tests/run_tests.sh
+```
+
 ## Hardware
 
 | Component | Pin | Description |
@@ -82,7 +88,7 @@ arduino-cli compile --fqbn arduino:renesas_uno:unor4wifi \
 | Status update rate | 10 Hz |
 | Heartbeat interval | 1000 ms |
 | UDP timeout | 2000 ms |
-| **WiFi command rate limit** | **20 ms min interval (50 Hz max)** |
+| **WiFi command repeat limit** | **UDP: 20 ms for all commands; MQTT: changed PWM applies immediately, identical repeats max 50 Hz** |
 | **RC deadband** | **±40 µs (joystick drift resistance)** |
 | **WiFi filter** | **100% alpha (direct control)** |
 | **RC filter** | **25% alpha (smooth)** |
@@ -278,7 +284,7 @@ The system uses different filtering parameters for optimal performance with each
 | Metric | RC | WiFi |
 |--------|-------|------|
 | Response Time | ~200-300ms (smooth ramp) | ~40-80ms (fast) |
-| Max Command Rate | Limited by human | 50 Hz (20ms min, UDP mode) |
+| Max Command Rate | Limited by human | UDP: 50 Hz; MQTT: changed PWM immediate, identical repeats 50 Hz |
 | Drift Resistance | High (±40µs deadband) | N/A (digital) |
 | Precision | Medium (joystick dependent) | High (exact values) |
 
@@ -578,6 +584,8 @@ const int DEADBAND_US = 40;            // Deadband around center (20-100µs)
 ### Command rate limiting
 
 - WiFi commands have **20ms minimum interval** in UDP mode (max 50 Hz)
+- MQTT applies every changed PWM pair immediately; only an identical repeat inside 20ms is suppressed
+- A suppressed identical MQTT repeat still refreshes command freshness and controller lease timestamps
 - PING is NOT rate limited (can be sent anytime)
 - Use keep-alive mode to maintain connection
 - RC control has **separate filtering** (25% alpha, smooth) to resist joystick drift
